@@ -1,6 +1,6 @@
 # PMS APK Builder
 
-**Universal-ish Android APK builder for GitHub repositories.** It is **not** a SING’OKEY patcher and contains no project keys, private content, payment overrides, hard-coded repository, or approved branch list. You select the repository and branch at run time. All builds take place in a temporary isolated checkout and the GitHub source remains untouched.
+**Portable Android APK builder for supported GitHub repositories.** It contains no project keys, private content, payment overrides, hard-coded repository, or approved branch list. You select the repository and branch at run time. All builds take place in a temporary isolated checkout and the GitHub source remains untouched.
 
 ## Get the portable Windows EXE
 
@@ -27,6 +27,12 @@ The builder signs the **final APK** using the same saved PKCS12 identity for tha
 - The vault intentionally refuses to overwrite any existing identity. One package ID maps to one pinned certificate. An app may use different certificates for independent release variants only if they have separate package IDs.
 - GitHub **Actions Secrets** are an **optional, explicit opt-in** convenience for CI, not recoverable storage. They can be used by repository workflows and admins with sufficient access can change those workflows. They are *not* a safe replacement for your offline encrypted backup. Never commit private keys in a GitHub folder or file, **even if the repo is private**.
 
+## Reusable build environment secrets
+
+Use **Save build secret** to store a build-only environment variable (for example `API_PUBLIC_TOKEN`) for the selected GitHub repository. It is encrypted locally with Windows DPAPI, supplied only to that repository's build subprocesses and not committed into source. Only enter secrets for repositories **you trust**, because npm/Gradle/Flutter scripts can read and potentially exfiltrate environment variables. Console output attempts to redact exact secret values; no logger can guarantee detection of deliberately transformed/exfiltrated secrets.
+
+Use **Backup build secrets** to create a separately encrypted `.pmsenv` file for transfer. The repository name and passphrase are required to restore it using `restore-secrets`; restores never replace existing saved secrets. GitHub Actions upload is a separate explicit opt-in for a selected repository, and GitHub secrets cannot be downloaded back. Never publish these files or commit them to Git.
+
 ## User workflow
 
 1. Launch `PMS-Apk-Builder.exe`. Select your `https://github.com/owner/repo`, then **Get branches**, and choose a branch.
@@ -39,7 +45,7 @@ Nothing is uploaded to GitHub by a local build. The repository can be public or 
 
 ## Optional GitHub Actions Secrets
 
-The **GitHub secrets** button or `github-secrets` CLI action requires an explicit warning confirmation. It uses an authenticated `gh` CLI and uploads through STDIN, never command-line arguments. It writes `PMS_SIGNING_P12_BASE64`, `PMS_SIGNING_PASSWORD`, `PMS_SIGNING_ALIAS`, `PMS_SIGNING_PACKAGE`, and `PMS_SIGNING_CERT_SHA256` to the **selected application repository's Actions secrets**, not PMS APK Builder itself. Only configure this in a repository whose maintainers/workflows you trust. Avoid exposing Actions secrets to forked pull requests or untrusted build scripts. GitHub won't reveal the secret values back to you. This tool does not automatically add a signing workflow to the application repo.
+The **GitHub secrets** button or `github-secrets` CLI action requires an explicit warning confirmation. It uses an authenticated `gh` CLI and uploads through STDIN, never command-line arguments. It writes `PMS_SIGNING_P12_BASE64`, `PMS_SIGNING_PASSWORD`, `PMS_SIGNING_ALIAS`, `PMS_SIGNING_PACKAGE`, and `PMS_SIGNING_CERT_SHA256` to the **selected application repository's Actions secrets**, not PMS APK Builder itself. Only configure this in a repository whose maintainers/workflows you trust. Avoid exposing Actions secrets to forked pull requests or untrusted build scripts. GitHub won't reveal the secret values back to you. With explicit approval it can also upload the encrypted local project environment-secret values as GitHub Actions secrets. This tool does not automatically add a signing workflow to the application repo.
 
 ## CLI / local development
 
@@ -50,10 +56,14 @@ python pms_builder.py audit
 python pms_builder.py branches --repo https://github.com/owner/project
 python pms_builder.py build --repo https://github.com/owner/project --branch feature/my-branch --output C:\\APK-output
 python pms_builder.py keys
+python pms_builder.py secrets --repo https://github.com/owner/project
+python pms_builder.py set-secret --repo https://github.com/owner/project --name API_PUBLIC_TOKEN
+python pms_builder.py backup-secrets --repo https://github.com/owner/project --output C:\Backups\project.pmsenv
+python pms_builder.py restore-secrets --repo https://github.com/owner/project --file C:\Backups\project.pmsenv
 python pms_builder.py backup --package com.example.app --output C:\\Backups\\app.pmskey
 python pms_builder.py restore --file C:\\Backups\\app.pmskey
 python pms_builder.py import-key --package com.example.app --keystore C:\\secure\\original.p12 --alias release
-python pms_builder.py github-secrets --repo https://github.com/owner/project --package com.example.app --confirm-upload
+python pms_builder.py github-secrets --repo https://github.com/owner/project --package com.example.app --confirm-upload --include-build-secrets
 python -m unittest discover -s tests -v
 ```
 

@@ -14,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 from pms_core import (
     VERSION, BuildError, SigningVault, create_release, detect_project,
     remote_branches, sdk_build_tools, tool, validate_repo, validate_branch,
-    publish_github_secrets, vault_root
+    publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root
 )
 
 
@@ -35,6 +35,14 @@ def command_line() -> int:
     a.add_argument('--authorize-new-signing-key',action='store_true',
        help='first-time signer ONLY; do not use for an already released app')
     a=sub.add_parser('keys',help='show package names with existing saved identities')
+    a=sub.add_parser('secrets',help='list stored project environment-secret NAMES (never values)')
+    a.add_argument('--repo',required=True)
+    a=sub.add_parser('set-secret',help='save one encrypted build environment variable')
+    a.add_argument('--repo',required=True);a.add_argument('--name',required=True)
+    a=sub.add_parser('backup-secrets',help='export encrypted repository build-secrets backup')
+    a.add_argument('--repo',required=True);a.add_argument('--output',required=True)
+    a=sub.add_parser('restore-secrets',help='restore build secrets into an empty local repo vault')
+    a.add_argument('--repo',required=True);a.add_argument('--file',required=True)
     a=sub.add_parser('backup',help='make an encrypted signing-key transfer backup')
     a.add_argument('--package',required=True);a.add_argument('--output',required=True)
     a=sub.add_parser('restore',help='restore a backed-up signing identity on another PC')
@@ -45,6 +53,7 @@ def command_line() -> int:
     a=sub.add_parser('github-secrets',help='opt-in write-only GitHub Actions secrets upload')
     a.add_argument('--repo',required=True);a.add_argument('--package',required=True)
     a.add_argument('--confirm-upload',action='store_true')
+    a.add_argument('--include-build-secrets',action='store_true')
     args=parser.parse_args()
     vault=SigningVault()
     try:
@@ -61,6 +70,24 @@ def command_line() -> int:
             for item in remote_branches(args.repo):print(item)
         elif args.action=='keys':
             for item in vault.list_packages():print(item)
+        elif args.action=='secrets':
+            for item in SecretVault().names(args.repo):print(item)
+        elif args.action=='set-secret':
+            v=getpass.getpass('Enter secret value (hidden): ')
+            if input('Type STORE to encrypt this value for the selected repository: ')!='STORE':
+                raise BuildError('Build secret not stored')
+            SecretVault().set(args.repo,args.name,v,confirm=True)
+            print('Build secret saved securely:',args.name)
+        elif args.action=='backup-secrets':
+            v=getpass.getpass('Backup passphrase (12+ characters): ')
+            v2=getpass.getpass('Repeat passphrase: ')
+            if v!=v2:raise BuildError('Backup passphrases did not match')
+            SecretVault().backup(args.repo,Path(args.output),v)
+            print('Encrypted project build secrets backup saved')
+        elif args.action=='restore-secrets':
+            v=getpass.getpass('Backup passphrase: ')
+            SecretVault().restore(Path(args.file),args.repo,v)
+            print('Project build secrets restored')
         elif args.action=='build':
             validate_branch(args.branch)
             if args.authorize_new_signing_key:
@@ -91,6 +118,8 @@ def command_line() -> int:
             if input('Type UPLOAD to set Actions secrets for this repository: ')!='UPLOAD':
                 raise BuildError('No secrets uploaded')
             publish_github_secrets(args.repo,args.package,vault,confirm=True,log=print)
+            if args.include_build_secrets:
+                publish_project_github_secrets(args.repo,SecretVault(),confirm=True,log=print)
         return 0
     except BuildError as e:
         print('SAFE STOP:',e,file=sys.stderr)
@@ -145,9 +174,13 @@ class PMSApp:
         self.buildbutton=ttk.Button(buttons,text='BUILD AND VERIFY APK',command=self.build)
         self.buildbutton.pack(side='left',padx=(0,10))
         for label,fn in [('Audit tools',self.audit),('Import key',self.import_key),
-                         ('Backup key',self.backup),('Restore key',self.restore),
-                         ('GitHub secrets',self.github_secrets)]:
+                         ('Backup key',self.backup),('Restore key',self.restore)]:
             ttk.Button(buttons,text=label,command=fn).pack(side='left',padx=3)
+        secrets_buttons=ttk.Frame(frame);secrets_buttons.pack(fill='x',pady=(0,10))
+        for label,fn in [('Save build secret',self.save_build_secret),
+                         ('Backup build secrets',self.backup_build_secrets),
+                         ('GitHub Actions secrets',self.github_secrets)]:
+            ttk.Button(secrets_buttons,text=label,command=fn).pack(side='left',padx=3)
         ttk.Label(frame,text='Build log (no keys or passwords are displayed)').pack(anchor='w')
         self.log_widget=tk.Text(frame,height=16,state='disabled',wrap='word',font=('Consolas',10))
         self.log_widget.pack(fill='both',expand=True)
@@ -257,6 +290,33 @@ class PMSApp:
         if not pw:return
         self.worker(lambda:self.log('Restored original signer: '+SigningVault().restore(Path(file),pw).package))
 
+    def save_build_secret(self):
+        repo=self.repo.get()
+        try:validate_repo(repo)
+        except BuildError as e:
+            messagebox.showwarning('GitHub repository',str(e));return
+        name=tk.simpledialog.askstring('Build environment secret','Environment variable NAME (UPPERCASE):',parent=self.root)
+        if not name:return
+        value=tk.simpledialog.askstring('Build secret value','Value (hidden; will be supplied only to this repository build):',
+                                       show='*',parent=self.root)
+        if not value:return
+        if not messagebox.askyesno('Save encrypted build secret',
+            'Build scripts from this repository can read this secret. Only build repositories you trust.\n\nSave locally encrypted for future builds?'):
+            return
+        self.worker(lambda:(SecretVault().set(repo,name,value,confirm=True),self.log('Build secret saved: '+name)))
+
+    def backup_build_secrets(self):
+        repo=self.repo.get()
+        try:validate_repo(repo)
+        except BuildError as e:
+            messagebox.showwarning('GitHub repository',str(e));return
+        file=filedialog.asksaveasfilename(defaultextension='.pmsenv',filetypes=[('Encrypted project secrets','*.pmsenv')])
+        if not file:return
+        pw=tk.simpledialog.askstring('Encrypt build secrets','Backup passphrase (12+ characters):',
+                                      show='*',parent=self.root)
+        if not pw:return
+        self.worker(lambda:(SecretVault().backup(repo,Path(file),pw),self.log('Encrypted project secrets backup created')))
+
     def github_secrets(self):
         package=self.require_package()
         if not package:return
@@ -266,7 +326,13 @@ class PMSApp:
             'Repository maintainers and workflows with access to those secrets may sign APKs.\n'
             'GitHub Actions secrets are NOT a recoverable backup. Continue?'):
             return
-        self.worker(lambda:publish_github_secrets(repo,package,SigningVault(),confirm=True,log=self.log))
+        include=messagebox.askyesno('Optional build environment secrets',
+          'Also upload all saved repository build environment secrets?\nOnly workflows for this repository should use these secrets.')
+        def task():
+            publish_github_secrets(repo,package,SigningVault(),confirm=True,log=self.log)
+            if include and SecretVault().names(repo):
+                publish_project_github_secrets(repo,SecretVault(),confirm=True,log=self.log)
+        self.worker(task)
 
 
 def main():

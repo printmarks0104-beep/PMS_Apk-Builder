@@ -359,29 +359,29 @@ def choose_apk(root:Path) ->Path:
     return next(iter(uniq))
 
 
-def build_source(root:Path, project_type:str, log=None):
+def build_source(root:Path, project_type:str, log=None, env=None):
     if project_type=='flutter':
-        run([tool('flutter'),'pub','get'],cwd=root,log=log)
-        run([tool('flutter'),'build','apk','--release'],cwd=root,log=log)
+        run([tool('flutter'),'pub','get'],cwd=root,log=log,env=env)
+        run([tool('flutter'),'build','apk','--release'],cwd=root,log=log,env=env)
     elif project_type=='capacitor':
         if not (root/'package-lock.json').is_file():
             raise BuildError('Capacitor requires package-lock.json for reproducible npm ci')
-        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'ci'],cwd=root,log=log)
+        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'ci'],cwd=root,log=log,env=env)
         data=json.loads((root/'package.json').read_text('utf8'))
         if 'build' not in data.get('scripts',{}):
             raise BuildError('Capacitor project must define an npm build script')
-        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],cwd=root,log=log)
+        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],cwd=root,log=log,env=env)
         npx=tool('npx.cmd' if os.name=='nt' else 'npx')
         if not (root/'android').is_dir():
-            run([npx,'--no-install','cap','add','android'],cwd=root,log=log)
-        run([npx,'--no-install','cap','sync','android'],cwd=root,log=log)
-        return build_source(root,'gradle-android',log=log)
+            run([npx,'--no-install','cap','add','android'],cwd=root,log=log,env=env)
+        run([npx,'--no-install','cap','sync','android'],cwd=root,log=log,env=env)
+        return build_source(root,'gradle-android',log=log,env=env)
     elif project_type in ('gradle','gradle-android'):
         gradle_dir=root/'android' if project_type=='gradle-android' else root
         wrapper=gradle_dir/('gradlew.bat' if os.name=='nt' else 'gradlew')
         if not wrapper.is_file():raise BuildError('Gradle wrapper missing')
         if os.name!='nt':wrapper.chmod(wrapper.stat().st_mode|0o111)
-        run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log)
+        run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log,env=env)
     else:
         raise BuildError('Unsupported project type')
 
@@ -441,7 +441,16 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         sha=clone_branch(repo_url,branch,src,log=log)
         kind=detect_project(src,project_type)
         if log:log(f'Project type: {kind} | source: {sha[:12]}')
-        build_source(src,kind,log=log)
+        # Only expose per-repository secrets to this repository's build commands,
+        # not to clone/git or unrelated projects. Build scripts are trusted code.
+        saved=SecretVault().values(repo_url)
+        build_env=os.environ.copy();build_env.update(saved)
+        def sanitized_log(message):
+            line=str(message)
+            for value in saved.values():
+                if value:line=line.replace(value,'[REDACTED]')
+            if log:log(line)
+        build_source(src,kind,log=sanitized_log,env=build_env)
         apk=choose_apk(src)
         pkg=apk_package(apk,sdk)
         identity=vault.load(pkg)
@@ -492,3 +501,136 @@ def publish_github_secrets(repo:str, package:str, vault:SigningVault, *, confirm
             raise BuildError('GitHub Actions secret upload failed for '+key+'; earlier secrets may already be set')
         if log:log('GitHub Actions secret updated: '+key+' (value never displayed)')
     if log:log('Note: GitHub Actions secrets are write-only, NOT a portable key backup. Export an encrypted backup separately.')
+
+
+SECRET_NAME_RE = re.compile(r'^[A-Z][A-Z0-9_]{1,63}$')
+# Prevent changing command resolution or replacing the signing protocol via env injection.
+RESERVED_BUILD_ENV = frozenset({
+    'PATH','PATHEXT','COMSPEC','SYSTEMROOT','WINDIR','TEMP','TMP','HOME','USERPROFILE',
+    'LOCALAPPDATA','APPDATA','JAVA_HOME','ANDROID_HOME','ANDROID_SDK_ROOT',
+    'PMS_SIGNING_PASSWORD','PMS_SIGNING_P12_BASE64','PMS_SIGNING_CERT_SHA256',
+    'PYTHONPATH','PYTHONHOME','GIT_CONFIG_COUNT','GIT_CONFIG_PARAMETERS',
+    'NODE_OPTIONS','GRADLE_OPTS','JAVA_TOOL_OPTIONS','_JAVA_OPTIONS'
+})
+
+
+class SecretVault:
+    """Optional per-repository encrypted build environment variables."""
+    def __init__(self, root: Path | None = None):
+        self.root=Path(root) if root else vault_root()/'build-secrets'
+
+    def _file(self, repo: str) -> tuple[str,Path]:
+        _,slug=validate_repo(repo)
+        digest=hashlib.sha256(slug.lower().encode('utf8')).hexdigest()
+        return slug,self.root/(digest+'.json')
+
+    def _read(self,repo: str) -> dict:
+        slug,filename=self._file(repo)
+        if not filename.exists():return {'format':1,'repo':slug.lower(),'values':{}}
+        if filename.is_symlink() or not filename.is_file():
+            raise BuildError('Build secret vault must not be a symlink')
+        cfg=json.loads(filename.read_text('utf8'))
+        if cfg.get('format')!=1 or cfg.get('repo')!=slug.lower() or not isinstance(cfg.get('values'),dict):
+            raise BuildError('Invalid repository secret vault')
+        return cfg
+
+    def names(self,repo: str)->list[str]:
+        return sorted(self._read(repo)['values'])
+
+    def set(self,repo: str,name: str,value: str,*,confirm=False)->None:
+        if not confirm:raise BuildError('Explicit permission required to store build secret')
+        if not SECRET_NAME_RE.fullmatch(name) or name in RESERVED_BUILD_ENV or name.startswith('PMS_'):
+            raise BuildError('Invalid or reserved build environment variable name')
+        if not value or len(value.encode('utf8'))>8192:
+            raise BuildError('Secret value must be between 1 and 8192 bytes')
+        cfg=self._read(repo)
+        if name in cfg['values']:
+            raise BuildError('This secret already exists. Delete it explicitly before replacing.')
+        cfg['values'][name]=base64.b64encode(dpapi_encrypt(value.encode('utf8'))).decode('ascii')
+        self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
+        slug,path=self._file(repo)
+        if path.exists() and path.is_symlink():raise BuildError('Unsafe secret file')
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf8',prefix='.pms-',suffix='.tmp',
+                     dir=str(self.root),delete=False) as f:
+            tmp=Path(f.name)
+            json.dump(cfg,f,indent=2)
+        try:tmp.replace(path)
+        finally:tmp.unlink(missing_ok=True)
+
+    def delete(self,repo: str,name: str,*,confirm=False):
+        if not confirm:raise BuildError('Explicit deletion confirmation required')
+        cfg=self._read(repo)
+        if name not in cfg['values']:raise BuildError('Secret does not exist')
+        del cfg['values'][name]
+        _,path=self._file(repo)
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf8',prefix='.pms-',suffix='.tmp',
+                     dir=str(self.root),delete=False) as f:
+            tmp=Path(f.name);json.dump(cfg,f,indent=2)
+        try:tmp.replace(path)
+        finally:tmp.unlink(missing_ok=True)
+
+    def values(self,repo: str)->dict[str,str]:
+        cfg=self._read(repo);res={}
+        for name,encoded in cfg['values'].items():
+            if not SECRET_NAME_RE.fullmatch(name) or name in RESERVED_BUILD_ENV or name.startswith('PMS_'):
+                raise BuildError('Unexpected secret name in saved vault')
+            try:res[name]=dpapi_decrypt(base64.b64decode(encoded,validate=True)).decode('utf8')
+            except (ValueError,UnicodeError) as e:raise BuildError('Cannot decrypt saved project build secret') from e
+        return res
+
+    def backup(self,repo:str,destination:Path,passphrase:str):
+        if len(passphrase)<12:raise BuildError('Secret backup requires a strong passphrase (12+ characters)')
+        if destination.exists():raise BuildError('Secret backup already exists; refusing overwrite')
+        _,slug=validate_repo(repo)
+        plaintext=json.dumps({'format':1,'repo':slug.lower(),'values':self.values(repo)}).encode('utf8')
+        salt=os.urandom(16);nonce=os.urandom(12)
+        key=hashlib.scrypt(passphrase.encode('utf8'),salt=salt,n=2**15,r=8,p=1,
+                          dklen=32,maxmem=128*1024*1024)
+        ciphertext=AESGCM(key).encrypt(nonce,plaintext,b'PMS-BUILD-ENV-BACKUP-V1')
+        obj={'format':1,'kind':'PMS-APK-BUILD-SECRETS-BACKUP',
+             'salt':base64.b64encode(salt).decode(), 'nonce':base64.b64encode(nonce).decode(),
+             'data':base64.b64encode(ciphertext).decode()}
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        with destination.open('x',encoding='utf8') as f:json.dump(obj,f)
+
+    def restore(self,file:Path,repo:str,passphrase:str):
+        _,slug=validate_repo(repo)
+        if not file.is_file() or file.stat().st_size>1024*1024:
+            raise BuildError('Invalid build secrets backup')
+        cfg=json.loads(file.read_text('utf8'))
+        if cfg.get('kind')!='PMS-APK-BUILD-SECRETS-BACKUP' or cfg.get('format')!=1:
+            raise BuildError('Wrong encrypted backup format')
+        if self.names(repo):raise BuildError('Existing build secrets must not be overwritten')
+        try:
+            salt=base64.b64decode(cfg['salt'],validate=True)
+            nonce=base64.b64decode(cfg['nonce'],validate=True)
+            data=base64.b64decode(cfg['data'],validate=True)
+            if len(salt)!=16 or len(nonce)!=12:raise ValueError('invalid params')
+            key=hashlib.scrypt(passphrase.encode('utf8'),salt=salt,n=2**15,r=8,p=1,
+                              dklen=32,maxmem=128*1024*1024)
+            raw=json.loads(AESGCM(key).decrypt(nonce,data,b'PMS-BUILD-ENV-BACKUP-V1'))
+            if raw.get('repo')!=slug.lower() or not isinstance(raw.get('values'),dict) or len(raw['values'])>100:
+                raise ValueError('wrong repo or size')
+            for k,v in raw['values'].items():
+                if not SECRET_NAME_RE.fullmatch(k) or k in RESERVED_BUILD_ENV or k.startswith('PMS_') \
+                        or not isinstance(v,str) or len(v.encode('utf8'))>8192 or not v:
+                    raise ValueError('malformed secret')
+            for k,v in raw['values'].items():self.set(repo,k,v,confirm=True)
+        except (ValueError,KeyError,UnicodeError,TypeError) as e:
+            raise BuildError('Cannot decrypt or validate build-secrets backup') from e
+        except Exception as e:
+            if isinstance(e,BuildError):raise
+            raise BuildError('Cannot decrypt or validate build-secrets backup') from e
+
+
+def publish_project_github_secrets(repo:str,vault:SecretVault,*,confirm=False,log=None):
+    if not confirm:raise BuildError('Explicit GitHub Actions secrets upload approval required')
+    _,slug=validate_repo(repo)
+    saved=vault.values(repo)
+    if not saved:raise BuildError('No project build secrets configured')
+    gh=tool('gh')
+    for name,value in saved.items():
+        p=subprocess.run([gh,'secret','set',name,'--repo',slug],input=value,
+                         text=True,capture_output=True,timeout=90)
+        if p.returncode:raise BuildError('Could not set GitHub Actions secret '+name)
+        if log:log('Stored GitHub Actions build secret: '+name+' (value hidden)')

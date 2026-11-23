@@ -57,6 +57,15 @@ class ValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(core.BuildError,'approval'):
             core.publish_github_secrets('https://github.com/owner/repo','com.example.test',core.SigningVault(),confirm=False)
 
+    def test_repository_build_secrets_names_restrictions(self):
+        with tempfile.TemporaryDirectory() as td:
+            v=core.SecretVault(Path(td))
+            with self.assertRaises(core.BuildError):
+                v.set('https://github.com/owner/repo','API_TOKEN','safe',confirm=False)
+            for name in ('PATH','JAVA_HOME','NODE_OPTIONS','PMS_SIGNING_PASSWORD','a_key'):
+                with self.assertRaises(core.BuildError):
+                    v.set('https://github.com/owner/repo',name,'safe',confirm=True)
+
     def test_create_identity_needs_confirmation(self):
         with tempfile.TemporaryDirectory() as td:
             vault=core.SigningVault(Path(td))
@@ -86,6 +95,23 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(a.password,b.password)
         with self.assertRaises(core.BuildError):self.vault.create('com.example.demo',confirm=True)
         self.assertEqual(a.fingerprint,self.vault.load('com.example.demo').fingerprint)
+
+    def test_build_env_secret_encryption_and_backup(self):
+        repo='https://github.com/owner/project'
+        vault=core.SecretVault(self.root/'secrets')
+        vault.set(repo,'PAYMENTS_PUBLIC_TOKEN','demo-testing-only',confirm=True)
+        self.assertEqual(vault.names(repo),['PAYMENTS_PUBLIC_TOKEN'])
+        self.assertNotIn('demo-testing-only',next((self.root/'secrets').iterdir()).read_text('utf8'))
+        self.assertEqual(vault.values(repo)['PAYMENTS_PUBLIC_TOKEN'],'demo-testing-only')
+        with self.assertRaises(core.BuildError):vault.set(repo,'PAYMENTS_PUBLIC_TOKEN','another',confirm=True)
+        backup=self.root/'repo.pmsenv'
+        vault.backup(repo,backup,'secret-test-passphrase')
+        self.assertNotIn('demo-testing-only',backup.read_text('utf8'))
+        recovered=core.SecretVault(self.root/'new-repo-vault')
+        with self.assertRaises(core.BuildError):recovered.restore(backup,repo,'wrong')
+        recovered.restore(backup,repo,'secret-test-passphrase')
+        self.assertEqual(recovered.values(repo),vault.values(repo))
+        with self.assertRaises(core.BuildError):recovered.restore(backup,repo,'secret-test-passphrase')
 
     def test_rename_or_modify_keystore_rejected(self):
         i=self.make_identity()
