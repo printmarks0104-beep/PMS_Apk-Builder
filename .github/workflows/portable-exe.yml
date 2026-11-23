@@ -1,0 +1,37 @@
+name: Build portable Windows EXE
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install locked-range dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Automated source and signer tests
+        run: python -m unittest discover -s tests -v
+      - name: Build self-contained Windows EXE
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name PMS-Apk-Builder --hidden-import tkinter.simpledialog pms_builder.py
+      - name: Archive portable app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item dist/PMS-Apk-Builder.exe package/
+          Copy-Item README.md package/
+          Compress-Archive -Path package/* -DestinationPath PMS-Apk-Builder-Windows-Portable.zip
+          Get-FileHash PMS-Apk-Builder-Windows-Portable.zip -Algorithm SHA256 | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PMS-Apk-Builder-Windows-Portable
+          path: PMS-Apk-Builder-Windows-Portable.zip
+          retention-days: 30

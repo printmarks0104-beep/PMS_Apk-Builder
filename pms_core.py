@@ -1,0 +1,494 @@
+"""Portable APK build/sign engine: no application-specific branches, files, or keys."""
+from __future__ import annotations
+
+import base64
+import ctypes
+import ctypes.wintypes
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import tempfile
+import time
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+VERSION = '0.1.0'
+BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
+PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
+BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
+GITHUB_RE = re.compile(r'^https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$', re.I)
+HEX40 = re.compile(r'^[a-f0-9]{40}$')
+
+
+class BuildError(Exception):
+    """Expected fail-closed error; credentials must not be included in messages."""
+
+
+def validate_repo(value: str) -> tuple[str, str]:
+    """Limit remote build inputs to explicitly selected GitHub repositories."""
+    m = GITHUB_RE.fullmatch(value.strip())
+    if not m or m.group(1).startswith('-') or m.group(2).startswith('-'):
+        raise BuildError('Enter an HTTPS GitHub URL such as https://github.com/owner/repository')
+    owner, name = m.group(1), m.group(2)
+    if name.endswith('.git'):
+        name = name[:-4]
+    if not name or name in ('.', '..') or '..' in name:
+        raise BuildError('Invalid GitHub repository name')
+    return f'https://github.com/{owner}/{name}.git', f'{owner}/{name}'
+
+
+def validate_branch(name: str) -> str:
+    s = name.strip()
+    if not BRANCH_RE.fullmatch(s) or any(t in s for t in ('..','//','@{','\\')) or \
+       s.endswith(('/', '.', '.lock')) or s.startswith(('-','/','.')):
+        raise BuildError('Invalid Git branch name')
+    for part in s.split('/'):
+        if not part or part.startswith('.') or part.endswith('.') or part.endswith('.lock'):
+            raise BuildError('Invalid branch component')
+    return s
+
+
+def validate_package_id(pkg: str) -> str:
+    if not PKG_RE.fullmatch(pkg) or len(pkg) > 200:
+        raise BuildError('Invalid Android application ID')
+    return pkg
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024*1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_id(value: str) -> str:
+    validate_package_id(value)
+    return value.lower()
+
+
+def safe_tag(value: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]', '-', value)[:55].strip('.-') or 'release'
+
+
+def vault_root() -> Path:
+    base = os.environ.get('LOCALAPPDATA') if os.name == 'nt' else os.environ.get('XDG_DATA_HOME')
+    return Path(base) / 'PMS-Apk-Builder' if base else Path.home()/'.local/share/PMS-Apk-Builder'
+
+
+def tool(name: str) -> str:
+    found = shutil.which(name)
+    if not found:
+        raise BuildError(f'Missing tool: {name}. Install the Android project toolchain and retry.')
+    return found
+
+
+def run(args: list[str], *, cwd: Path | None = None, env: dict | None = None,
+        log=None, capture=False, timeout=None) -> str:
+    """Never pass commands via a shell; do not log inherited environment."""
+    if log:
+        log('Running: ' + ' '.join(Path(a).name if i == 0 else a for i,a in enumerate(args))
+            if not any('pass' in str(a).lower() for a in args) else 'Running secure signing tool')
+    try:
+        result = subprocess.run(args, cwd=cwd, env=env, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                timeout=timeout, check=False, errors='replace')
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise BuildError(f'Command could not complete: {Path(args[0]).name} ({type(e).__name__})') from e
+    if log and result.stdout:
+        # Passwords live only in process env. Never print the signing env or key material.
+        for line in result.stdout.splitlines():
+            log(line[:1500])
+    if result.returncode:
+        raise BuildError(f'{Path(args[0]).name} failed (exit {result.returncode}); no APK declared verified')
+    return result.stdout if capture else ''
+
+
+def dpapi_encrypt(data: bytes) -> bytes:
+    if os.name != 'nt':
+        raise BuildError('Local signing vault requires Windows DPAPI. Use the Windows EXE.')
+    class Blob(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_byte))]
+    raw = ctypes.create_string_buffer(data)
+    in_blob = Blob(len(data), ctypes.cast(raw, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = Blob()
+    crypt = ctypes.windll.crypt32
+    if not crypt.CryptProtectData(ctypes.byref(in_blob), 'PMS APK signing', None, None,
+                                  None, 0, ctypes.byref(out_blob)):
+        raise BuildError('Windows DPAPI could not encrypt the signing password')
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(out_blob.pbData, ctypes.c_void_p))
+
+
+def dpapi_decrypt(blob: bytes) -> bytes:
+    if os.name != 'nt':
+        raise BuildError('Local signing vault requires Windows DPAPI. Use the Windows EXE.')
+    class Blob(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.wintypes.DWORD), ('pbData', ctypes.POINTER(ctypes.c_byte))]
+    raw = ctypes.create_string_buffer(blob)
+    in_blob = Blob(len(blob), ctypes.cast(raw, ctypes.POINTER(ctypes.c_byte)))
+    out_blob = Blob()
+    crypt = ctypes.windll.crypt32
+    if not crypt.CryptUnprotectData(ctypes.byref(in_blob), None, None, None,
+                                    None, 0, ctypes.byref(out_blob)):
+        raise BuildError('Signing password cannot be unlocked by this Windows user; restore an encrypted backup')
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(out_blob.pbData, ctypes.c_void_p))
+
+
+def keytool_certificate(keystore: Path, alias: str, password: str) -> str:
+    env = os.environ.copy(); env['PMS_SIGNING_PASSWORD'] = password
+    out = run([tool('keytool'), '-list', '-v', '-storetype', 'PKCS12',
+               '-keystore', str(keystore), '-alias', alias,
+               '-storepass:env', 'PMS_SIGNING_PASSWORD'], env=env, capture=True)
+    m = re.search(r'SHA256:\s*([0-9A-Fa-f:]{64,95})', out)
+    if not m:
+        raise BuildError('Cannot obtain certificate SHA-256 from keystore')
+    digest = m.group(1).replace(':','').lower()
+    if not re.fullmatch(r'[a-f0-9]{64}',digest):
+        raise BuildError('Invalid signer certificate SHA-256')
+    return digest
+
+
+@dataclass
+class Identity:
+    package: str
+    alias: str
+    fingerprint: str
+    keystore: Path
+    password: str
+
+
+class SigningVault:
+    def __init__(self, root: Path | None = None):
+        self.root = Path(root) if root else vault_root()/ 'signing'
+
+    def location(self, package: str) -> Path:
+        return self.root / canonical_id(package)
+
+    def list_packages(self) -> list[str]:
+        if not self.root.is_dir(): return []
+        return sorted(p.name for p in self.root.iterdir() if p.is_dir() and (p/'identity.json').exists())
+
+    def load(self, package: str) -> Identity | None:
+        dirpath=self.location(package)
+        meta=dirpath/'identity.json'
+        key=dirpath/'release.p12'
+        secret=dirpath/'password.dpapi'
+        if not dirpath.exists(): return None
+        if not all(p.is_file() and not p.is_symlink() for p in (meta,key,secret)):
+            raise BuildError('Partial or unsafe signing identity; refusing to generate another')
+        cfg=json.loads(meta.read_text('utf8'))
+        if cfg.get('format') != 1 or cfg.get('package') != canonical_id(package) or \
+           cfg.get('alias') != 'pmsrelease' and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',str(cfg.get('alias'))):
+            raise BuildError('Invalid signing identity metadata')
+        if sha256_file(key) != cfg.get('keystoreSha256'):
+            raise BuildError('Keystore integrity mismatch; refusing to sign')
+        password=dpapi_decrypt(secret.read_bytes()).decode('utf8')
+        fp=keytool_certificate(key,cfg['alias'],password)
+        if fp != cfg.get('fingerprint'):
+            raise BuildError('Signer fingerprint changed; refusing to sign')
+        return Identity(cfg['package'],cfg['alias'],fp,key,password)
+
+    def _save(self,package: str,alias: str,password: str,src: Path) -> Identity:
+        dest=self.location(package)
+        if dest.exists():
+            raise BuildError('Signing identity already exists; will not overwrite existing keys')
+        dest.mkdir(parents=True, mode=0o700, exist_ok=False)
+        try:
+            cert=keytool_certificate(src,alias,password)
+            (dest/'release.p12').write_bytes(src.read_bytes())
+            (dest/'password.dpapi').write_bytes(dpapi_encrypt(password.encode('utf8')))
+            meta={'format':1,'package':canonical_id(package),'alias':alias,
+                  'fingerprint':cert,'keystoreSha256':sha256_file(dest/'release.p12'),
+                  'createdUtc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+            (dest/'identity.json').write_text(json.dumps(meta,indent=2)+'\n','utf8')
+            return Identity(canonical_id(package),alias,cert,dest/'release.p12',password)
+        except Exception:
+            # Only own newly-created identity directory, never remove pre-existing material.
+            shutil.rmtree(dest,ignore_errors=True)
+            raise
+
+    def create(self, package: str, *, confirm=False) -> Identity:
+        validate_package_id(package)
+        if not confirm:
+            raise BuildError('Explicit first-time signing-key approval required')
+        if self.location(package).exists():
+            raise BuildError('Existing signing identity present. Automatic replacement forbidden.')
+        password=secrets.token_urlsafe(42)
+        env=os.environ.copy();env['PMS_SIGNING_PASSWORD']=password
+        with tempfile.TemporaryDirectory(prefix='pms-signing-') as tmp:
+            target=Path(tmp)/'release.p12'
+            run([tool('keytool'), '-genkeypair','-v','-storetype','PKCS12',
+                 '-keystore',str(target),'-alias','pmsrelease','-keyalg','RSA',
+                 '-keysize','3072','-sigalg','SHA256withRSA','-validity','9125',
+                 '-dname','CN=APK Release, OU=PMS Builder, O=Local Owner, C=US',
+                 '-storepass:env','PMS_SIGNING_PASSWORD',
+                 '-keypass:env','PMS_SIGNING_PASSWORD','-noprompt'],env=env)
+            return self._save(package,'pmsrelease',password,target)
+
+    def import_existing(self, package: str, keystore: Path, alias: str, password: str) -> Identity:
+        """For upgrades to an already published app: original signer is mandatory."""
+        validate_package_id(package)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',alias):
+            raise BuildError('Invalid keystore alias')
+        if not keystore.is_file() or keystore.is_symlink():
+            raise BuildError('Existing signing keystore not found')
+        with tempfile.TemporaryDirectory(prefix='pms-import-') as tmp:
+            # Normalize JKS or PKCS12 to a standalone PKCS12 vault; store no plaintext passwords.
+            tmpkeystore=Path(tmp)/'import.p12'
+            env=os.environ.copy();env['PMS_SIGNING_PASSWORD']=password
+            # PKCS12 copy; JKS users must convert to PKCS12 explicitly using keytool beforehand.
+            run([tool('keytool'),'-list','-storetype','PKCS12','-keystore',str(keystore),
+                 '-alias',alias,'-storepass:env','PMS_SIGNING_PASSWORD'],env=env)
+            shutil.copyfile(keystore,tmpkeystore)
+            return self._save(package,alias,password,tmpkeystore)
+
+    def backup(self, package: str, destination: Path, passphrase: str):
+        if len(passphrase) < 12:
+            raise BuildError('Encrypted-backup passphrase must be at least 12 characters')
+        ident=self.load(package)
+        if ident is None:
+            raise BuildError('No signing key saved for this app')
+        if destination.exists():
+            raise BuildError('Refusing to overwrite an existing backup')
+        payload=json.dumps({'format':1,'package':ident.package,'alias':ident.alias,
+          'fingerprint':ident.fingerprint,'password':ident.password,
+          'keystore':base64.b64encode(ident.keystore.read_bytes()).decode('ascii')}).encode('utf8')
+        salt=os.urandom(16);nonce=os.urandom(12)
+        key=hashlib.scrypt(passphrase.encode('utf8'),salt=salt,n=2**15,r=8,p=1,dklen=32,maxmem=128*1024*1024)
+        cipher=AESGCM(key).encrypt(nonce,payload,BACKUP_AAD)
+        wrapper={'format':1,'kind':'PMS-APK-SIGNING-BACKUP','salt':base64.b64encode(salt).decode(),
+                 'nonce':base64.b64encode(nonce).decode(),'data':base64.b64encode(cipher).decode()}
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open('x',encoding='utf8') as f:json.dump(wrapper,f)
+
+    def restore(self, file: Path, passphrase: str) -> Identity:
+        if not file.is_file() or file.stat().st_size > 20*1024*1024:
+            raise BuildError('Invalid or oversized encrypted signing backup')
+        cfg=json.loads(file.read_text('utf8'))
+        if cfg.get('kind')!='PMS-APK-SIGNING-BACKUP' or cfg.get('format')!=1:
+            raise BuildError('Unknown signing backup format')
+        try:
+            salt=base64.b64decode(cfg['salt'],validate=True)
+            nonce=base64.b64decode(cfg['nonce'],validate=True)
+            body=base64.b64decode(cfg['data'],validate=True)
+            if len(salt)!=16 or len(nonce)!=12:raise ValueError('invalid salt/nonce')
+            key=hashlib.scrypt(passphrase.encode('utf8'),salt=salt,n=2**15,r=8,p=1,dklen=32,maxmem=128*1024*1024)
+            payload=json.loads(AESGCM(key).decrypt(nonce,body,BACKUP_AAD))
+            package=validate_package_id(payload['package'])
+            if self.location(package).exists():
+                raise BuildError('Signing identity already exists; will not overwrite it')
+            src=base64.b64decode(payload['keystore'],validate=True)
+            if len(src)>10*1024*1024:raise ValueError('keystore too big')
+            with tempfile.TemporaryDirectory(prefix='pms-restore-') as td:
+                path=Path(td)/'restore.p12';path.write_bytes(src)
+                ident=self._save(package,payload['alias'],payload['password'],path)
+            if ident.fingerprint!=payload['fingerprint']:
+                shutil.rmtree(self.location(package),ignore_errors=True)
+                raise BuildError('Restored signing fingerprint does not match backup')
+            return ident
+        except BuildError:
+            raise
+        except (ValueError,KeyError,TypeError,UnicodeError) as e:
+            raise BuildError('Backup decryption failed or backup was modified') from e
+        except Exception as e:
+            raise BuildError('Backup decryption failed or backup was modified') from e
+
+
+def sdk_build_tools() -> dict[str,Path]:
+    roots=[os.environ.get('ANDROID_SDK_ROOT'),os.environ.get('ANDROID_HOME')]
+    home=Path.home();roots.extend([str(home/'AppData/Local/Android/Sdk'),str(home/'Android/Sdk')])
+    for root in filter(None, roots):
+        build=Path(root)/'build-tools'
+        if not build.is_dir():continue
+        versions=sorted((x for x in build.iterdir() if x.is_dir()),
+                        key=lambda x: tuple(int(y) for y in re.findall(r'\d+',x.name)),reverse=True)
+        for v in versions:
+            tools={n:v/(n+'.exe' if os.name=='nt' else n) for n in ('aapt','zipalign','apksigner')}
+            if all(x.is_file() for x in tools.values()):return tools
+    raise BuildError('Android SDK build-tools missing: require aapt, zipalign and apksigner')
+
+
+def apk_package(apk: Path, sdk: dict[str,Path]) -> str:
+    out=run([str(sdk['aapt']),'dump','badging',str(apk)],capture=True)
+    m=re.search(r"^package:\s+name='([^']+)'",out,re.M)
+    if not m:
+        raise BuildError('APK package ID could not be read; refusing to sign')
+    return validate_package_id(m.group(1))
+
+
+def detect_project(root: Path, forced: str='auto') -> str:
+    types=[]
+    if (root/'pubspec.yaml').is_file() and (root/'android').is_dir():types.append('flutter')
+    if ((root/'capacitor.config.ts').is_file() or (root/'capacitor.config.json').is_file()) and \
+       (root/'package.json').is_file():types.append('capacitor')
+    if ((root/'gradlew.bat').is_file() or (root/'gradlew').is_file()) and \
+       ((root/'app').is_dir() or (root/'settings.gradle').is_file() or (root/'settings.gradle.kts').is_file()):types.append('gradle')
+    if (root/'android'/'gradlew.bat').is_file() or (root/'android'/'gradlew').is_file():types.append('gradle-android')
+    if forced!='auto':
+        if forced not in types:raise BuildError(f'Project is not a supported {forced} repository')
+        return forced
+    for choice in ('flutter','capacitor','gradle-android','gradle'):
+        if choice in types:return choice
+    raise BuildError('No supported Android project found (Flutter, Capacitor or Gradle Android)')
+
+
+def choose_apk(root:Path) ->Path:
+    candidates=[p for p in root.rglob('*.apk') if p.is_file() and ('release' in p.name.lower() or 'release' in '/'.join(p.parts[-5:]).lower())
+                and ('outputs' in p.parts or 'flutter-apk' in p.parts)
+                and 'test' not in p.name.lower() and not p.name.lower().endswith('-androidtest.apk')]
+    # Flutter may create both a wrapper APK and an identical Gradle intermediate.
+    flutter=[p for p in candidates if 'flutter-apk' in p.parts]
+    if flutter:candidates=flutter
+    uniq={p.resolve() for p in candidates}
+    if len(uniq)!=1:
+        raise BuildError(f'Expected exactly one release APK, found {len(uniq)}. Choose a single app/variant before building.')
+    return next(iter(uniq))
+
+
+def build_source(root:Path, project_type:str, log=None):
+    if project_type=='flutter':
+        run([tool('flutter'),'pub','get'],cwd=root,log=log)
+        run([tool('flutter'),'build','apk','--release'],cwd=root,log=log)
+    elif project_type=='capacitor':
+        if not (root/'package-lock.json').is_file():
+            raise BuildError('Capacitor requires package-lock.json for reproducible npm ci')
+        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'ci'],cwd=root,log=log)
+        data=json.loads((root/'package.json').read_text('utf8'))
+        if 'build' not in data.get('scripts',{}):
+            raise BuildError('Capacitor project must define an npm build script')
+        run([tool('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],cwd=root,log=log)
+        npx=tool('npx.cmd' if os.name=='nt' else 'npx')
+        if not (root/'android').is_dir():
+            run([npx,'--no-install','cap','add','android'],cwd=root,log=log)
+        run([npx,'--no-install','cap','sync','android'],cwd=root,log=log)
+        return build_source(root,'gradle-android',log=log)
+    elif project_type in ('gradle','gradle-android'):
+        gradle_dir=root/'android' if project_type=='gradle-android' else root
+        wrapper=gradle_dir/('gradlew.bat' if os.name=='nt' else 'gradlew')
+        if not wrapper.is_file():raise BuildError('Gradle wrapper missing')
+        if os.name!='nt':wrapper.chmod(wrapper.stat().st_mode|0o111)
+        run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log)
+    else:
+        raise BuildError('Unsupported project type')
+
+
+def signed_apk(source_apk:Path, package:str, identity:Identity, dest:Path, sdk:dict[str,Path],log=None):
+    if canonical_id(package)!=identity.package:
+        raise BuildError('APK package does not match the signing identity')
+    if dest.exists():raise BuildError('Destination APK already exists; refusing overwrite')
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='pms-sign-apk-') as td:
+        aligned=Path(td)/'aligned.apk'
+        staging=Path(td)/'signed.apk'
+        run([str(sdk['zipalign']),'-f','-p','4',str(source_apk),str(aligned)],log=log)
+        env=os.environ.copy();env['PMS_SIGNING_PASSWORD']=identity.password
+        run([str(sdk['apksigner']),'sign','--ks',str(identity.keystore),
+             '--ks-key-alias',identity.alias,'--ks-pass','env:PMS_SIGNING_PASSWORD',
+             '--key-pass','env:PMS_SIGNING_PASSWORD','--out',str(staging),str(aligned)],env=env,log=log)
+        checked=run([str(sdk['apksigner']),'verify','--verbose','--print-certs',str(staging)],capture=True)
+        fps=re.findall(r'Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9]+)',checked)
+        if len(fps)!=1 or fps[0].lower()!=identity.fingerprint:
+            raise BuildError('APK signer certificate verification failed; refusing output')
+        if apk_package(staging,sdk)!=package:
+            raise BuildError('APK package changed during signing')
+        shutil.copyfile(staging,dest)
+    return sha256_file(dest)
+
+
+def clone_branch(repo:str,branch:str,working:Path,log=None) -> str:
+    url,_=validate_repo(repo);branch=validate_branch(branch)
+    if working.exists():raise BuildError('Temporary checkout path already exists')
+    run([tool('git'),'-c','protocol.file.allow=never','clone','--no-checkout','--depth','1',
+         '--single-branch','--branch',branch,url,str(working)],log=log)
+    commit=run([tool('git'),'rev-parse','HEAD'],cwd=working,capture=True).strip()
+    if not HEX40.fullmatch(commit):raise BuildError('Cannot verify cloned commit ID')
+    run([tool('git'),'checkout','--detach',commit],cwd=working,log=log)
+    return commit
+
+
+def remote_branches(repo:str)->list[str]:
+    url,_=validate_repo(repo)
+    out=run([tool('git'),'ls-remote','--heads',url],capture=True)
+    names=[]
+    for line in out.splitlines():
+        match=re.fullmatch(r'[a-f0-9]{40}\s+refs/heads/(.+)',line)
+        if match:
+            try:names.append(validate_branch(match.group(1)))
+            except BuildError:pass
+    return sorted(names)
+
+
+def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
+                   project_type='auto',allow_new_key=False,log=None) -> dict:
+    repo_url,repo_name=validate_repo(repo);branch=validate_branch(branch)
+    sdk=sdk_build_tools()
+    with tempfile.TemporaryDirectory(prefix='pms-android-build-') as work:
+        src=Path(work)/'source'
+        sha=clone_branch(repo_url,branch,src,log=log)
+        kind=detect_project(src,project_type)
+        if log:log(f'Project type: {kind} | source: {sha[:12]}')
+        build_source(src,kind,log=log)
+        apk=choose_apk(src)
+        pkg=apk_package(apk,sdk)
+        identity=vault.load(pkg)
+        if not identity:
+            if not allow_new_key:
+                raise BuildError('No signer found for '+pkg+'. Import original release keystore or explicitly authorize NEW signing identity (new installs only).')
+            if log:log('First-time signing identity creation approved for '+pkg)
+            identity=vault.create(pkg,confirm=True)
+        # APK's package ID and signer's certificate are verified after signing.
+        output=Path(output).expanduser().resolve()
+        filename=f'{safe_tag(pkg)}-{safe_tag(branch)}-{sha[:12]}.apk'
+        dest=output/filename
+        digest=signed_apk(apk,pkg,identity,dest,sdk,log=log)
+        meta={'format':1,'repo':repo_name,'branch':branch,'sourceCommit':sha,
+              'projectType':kind,'package':pkg,'signerFingerprint':identity.fingerprint,
+              'apk':filename,'sha256':digest,'createdUtc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+        manifest=dest.with_suffix('.manifest.json')
+        if manifest.exists():
+            dest.unlink(missing_ok=True)
+            raise BuildError('Release manifest exists; refusing to overwrite')
+        manifest.write_text(json.dumps(meta,indent=2)+'\n','utf8')
+        if log:log('VERIFIED APK: '+str(dest)+' | SHA-256: '+digest)
+        return meta
+
+
+def publish_github_secrets(repo:str, package:str, vault:SigningVault, *, confirm:bool=False, log=None):
+    """Explicit opt-in only. GitHub Actions secrets are WRITE-ONLY, never a recovery backup."""
+    if not confirm:raise BuildError('Explicit GitHub Actions secrets upload approval required')
+    _, name=validate_repo(repo)
+    identity=vault.load(package)
+    if not identity:raise BuildError('Signing identity missing')
+    gh=tool('gh')
+    # Do not pass secrets as CLI arguments or write plaintext temporary secret files.
+    pairs={
+        'PMS_SIGNING_P12_BASE64':base64.b64encode(identity.keystore.read_bytes()).decode('ascii'),
+        'PMS_SIGNING_PASSWORD':identity.password,
+        'PMS_SIGNING_ALIAS':identity.alias,
+        'PMS_SIGNING_PACKAGE':identity.package,
+        'PMS_SIGNING_CERT_SHA256':identity.fingerprint
+    }
+    for key,value in pairs.items():
+        try:
+            p=subprocess.run([gh,'secret','set',key,'--repo',name],input=value,
+                             text=True,capture_output=True,timeout=90)
+        except (OSError,subprocess.TimeoutExpired) as e:
+            raise BuildError('GitHub CLI could not store Actions secret '+key) from e
+        if p.returncode:
+            raise BuildError('GitHub Actions secret upload failed for '+key+'; earlier secrets may already be set')
+        if log:log('GitHub Actions secret updated: '+key+' (value never displayed)')
+    if log:log('Note: GitHub Actions secrets are write-only, NOT a portable key backup. Export an encrypted backup separately.')

@@ -1,0 +1,22 @@
+# Keys and secret-bearing backups must NEVER be committed
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pmskey
+*.pem
+*.key
+*.env
+.env*
+*.apk
+*.aab
+*secret*
+*password*
+*.log
+build/
+dist/
+*.spec
+__pycache__/
+.pytest_cache/
+.venv/
+*.zip
