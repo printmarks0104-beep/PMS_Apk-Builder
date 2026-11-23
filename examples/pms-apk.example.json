@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "profiles": {
+    "release": {
+      "projectType": "capacitor",
+      "package": "com.example.app",
+      "signerSha256": null,
+      "minApkBytes": 100000,
+      "environment": { "APP_BUILD_MODE": "release" },
+      "requiredEnvironment": ["APP_PUBLIC_CONFIGURATION"],
+      "steps": {
+        "beforeSync": [["node", "scripts/check-release.mjs"]],
+        "afterSync": [["node", "scripts/prepare-android.mjs"]],
+        "beforeGradle": [],
+        "afterSign": [["node", "scripts/verify-apk.mjs", "{apk}"]]
+      }
+    }
+  }
+}

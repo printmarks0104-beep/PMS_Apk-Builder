@@ -19,8 +19,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pms_recipe import RecipeError, load_recipe, recipe_env, run_recipe_stage
 
-VERSION = '0.1.3'
+VERSION = '0.1.4'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -659,7 +660,7 @@ def choose_apk(root:Path) ->Path:
     return next(iter(uniq))
 
 
-def build_source(root:Path, project_type:str, log=None, env=None, sdk_root=None):
+def build_source(root:Path, project_type:str, log=None, env=None, sdk_root=None, recipe=None, recipe_step_env=None):
     if project_type=='flutter':
         run([tool('flutter'),'pub','get'],cwd=root,log=log,env=env)
         run([tool('flutter'),'build','apk','--release'],cwd=root,log=log,env=env)
@@ -671,16 +672,19 @@ def build_source(root:Path, project_type:str, log=None, env=None, sdk_root=None)
         if 'build' not in data.get('scripts',{}):
             raise BuildError('Capacitor project must define an npm build script')
         run([tool('npm.cmd' if os.name=='nt' else 'npm'),'run','build'],cwd=root,log=log,env=env)
+        if recipe:run_recipe_stage(recipe,'beforeSync',root,recipe_step_env or env,tool,run,log=log)
         npx=tool('npx.cmd' if os.name=='nt' else 'npx')
         if not (root/'android').is_dir():
             run([npx,'--no-install','cap','add','android'],cwd=root,log=log,env=env)
         run([npx,'--no-install','cap','sync','android'],cwd=root,log=log,env=env)
-        return build_source(root,'gradle-android',log=log,env=env,sdk_root=sdk_root)
+        if recipe:run_recipe_stage(recipe,'afterSync',root,recipe_step_env or env,tool,run,log=log)
+        return build_source(root,'gradle-android',log=log,env=env,sdk_root=sdk_root,recipe=recipe,recipe_step_env=recipe_step_env)
     elif project_type in ('gradle','gradle-android'):
         gradle_dir=root/'android' if project_type=='gradle-android' else root
         wrapper=gradle_dir/('gradlew.bat' if os.name=='nt' else 'gradlew')
         if not wrapper.is_file():raise BuildError('Gradle wrapper missing')
         if sdk_root is not None:configure_gradle_sdk(gradle_dir,Path(sdk_root))
+        if recipe:run_recipe_stage(recipe,'beforeGradle',root,recipe_step_env or env,tool,run,log=log)
         if os.name!='nt':wrapper.chmod(wrapper.stat().st_mode|0o111)
         run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log,env=env)
     else:
@@ -735,17 +739,38 @@ def remote_branches(repo:str)->list[str]:
 
 def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
                    project_type='auto',allow_new_key=False,log=None, sdk_root=None,
-                   expected_package: str | None = None) -> dict:
+                   expected_package: str | None = None, recipe_profile: str = 'auto',
+                   recipe_file: Path | None = None) -> dict:
     repo_url,repo_name=validate_repo(repo);branch=validate_branch(branch)
     sdk=sdk_build_tools(sdk_root)
     if log:log('Android SDK Build Tools found at: '+str(sdk['aapt'].parent))
     with tempfile.TemporaryDirectory(prefix='pms-android-build-') as work:
         src=Path(work)/'source'
         sha=clone_branch(repo_url,branch,src,log=log)
+        try:recipe=load_recipe(src,recipe_profile,external_file=recipe_file)
+        except RecipeError as exc:raise BuildError(str(exc)) from exc
         kind=detect_project(src,project_type)
-        if log:log(f'Project type: {kind} | source: {sha[:12]}')
-        preflight_signer(src,kind,vault,expected_package=expected_package,
-                         allow_new_key=allow_new_key,log=log)
+        if recipe and recipe.project_type!=kind:
+            raise BuildError('Recipe project type does not match detected Android project')
+        if recipe and expected_package and expected_package.lower()!=recipe.package.lower():
+            raise BuildError('Requested package does not match selected recipe profile')
+        if recipe_file and log:log('Using user-selected local build recipe (never committed to source).')
+        if log:log(f'Project type: {kind} | source: {sha[:12]}' +
+                   (f' | native recipe: {recipe.profile}' if recipe else ' | generic build'))
+        if recipe:
+            identity=vault.load(recipe.package)
+            if not identity and recipe.signer_sha256:
+                raise BuildError('Recipe requires ORIGINAL signing certificate for '+recipe.package+
+                    '. Import its matching keystore. New-key generation is forbidden.')
+            if identity and recipe.signer_sha256 and identity.fingerprint!=recipe.signer_sha256:
+                raise BuildError('SIGNER MISMATCH: saved signer for '+recipe.package+
+                    ' does not match the original certificate required by this release recipe. '
+                    'Do not publish an update using a different signing key.')
+            if not identity and not allow_new_key:
+                raise BuildError('No signer imported for recipe package '+recipe.package)
+        else:
+            preflight_signer(src,kind,vault,expected_package=expected_package,
+                             allow_new_key=allow_new_key,log=log)
         # Only expose per-repository secrets to this repository's build commands,
         # not to clone/git or unrelated projects. Build scripts are trusted code.
         saved=SecretVault().values(repo_url)
@@ -755,14 +780,35 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         selected_sdk=sdk['aapt'].parent.parent.parent
         build_env['ANDROID_HOME']=str(selected_sdk)
         build_env['ANDROID_SDK_ROOT']=str(selected_sdk)
+        recipe_step_env=None
+        if recipe:
+            build_env['CM_BRANCH']=branch
+            build_env['CM_COMMIT']=sha
+            build_env['CM_REPO_SLUG']=repo_name
+            identity=vault.load(recipe.package)
+            signing={}
+            if identity:
+                signing={'CM_KEYSTORE_PATH':str(identity.keystore),
+                         'CM_KEYSTORE_PASSWORD':identity.password,
+                         'CM_KEY_PASSWORD':identity.password,
+                         'CM_KEY_ALIAS':identity.alias,
+                         'KARAOKEY_SIGNING_CERT_SHA256':identity.fingerprint}
+            try:recipe_step_env=recipe_env(recipe,build_env,signing,source_root=src)
+            except RecipeError as exc:raise BuildError(str(exc)) from exc
         def sanitized_log(message):
             line=str(message)
-            for value in saved.values():
+            for value in list(saved.values())+([identity.password] if recipe and identity else []):
                 if value:line=line.replace(value,'[REDACTED]')
             if log:log(line)
-        build_source(src,kind,log=sanitized_log,env=build_env,sdk_root=selected_sdk)
+        build_kwargs={'log':sanitized_log,'env':build_env,'sdk_root':selected_sdk}
+        if recipe:
+            build_kwargs['recipe']=recipe
+            build_kwargs['recipe_step_env']=recipe_step_env
+        build_source(src,kind,**build_kwargs)
         apk=choose_apk(src)
         pkg=apk_package(apk,sdk)
+        if recipe and pkg.lower()!=recipe.package.lower():
+            raise BuildError('Recipe profile produced wrong Android package '+pkg+'; expected '+recipe.package)
         if expected_package and pkg.lower()!=expected_package.lower():
             raise BuildError('Compiled APK package '+pkg+' differs from selected package '+
                              expected_package+'. Do not sign the wrong app variant.')
@@ -777,8 +823,23 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         filename=f'{safe_tag(pkg)}-{safe_tag(branch)}-{sha[:12]}.apk'
         dest=output/filename
         digest=signed_apk(apk,pkg,identity,dest,sdk,log=log)
+        try:
+            if recipe:
+                if dest.stat().st_size<recipe.min_apk_bytes:
+                    raise BuildError('APK too small for required native release recipe: '+
+                        str(dest.stat().st_size)+' bytes, minimum '+str(recipe.min_apk_bytes)+
+                        '. Missing native features; refusing release.')
+                run_recipe_stage(recipe,'afterSign',src,recipe_step_env,tool,run,apk=dest,log=sanitized_log)
+                # Verification runs again in case a repository-owned post-sign step
+                # touched the APK; signer/package identity must remain invariant.
+                verify_signer_against_original_apk(dest,pkg,vault,sdk=sdk)
+                digest=sha256_file(dest)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
         meta={'format':1,'repo':repo_name,'branch':branch,'sourceCommit':sha,
-              'projectType':kind,'package':pkg,'signerFingerprint':identity.fingerprint,
+              'projectType':kind,'recipeProfile':recipe.profile if recipe else None,
+              'package':pkg,'signerFingerprint':identity.fingerprint,
               'apk':filename,'sha256':digest,'createdUtc':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
         manifest=dest.with_suffix('.manifest.json')
         if manifest.exists():

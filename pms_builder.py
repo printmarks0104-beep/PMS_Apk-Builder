@@ -56,6 +56,8 @@ def command_line() -> int:
     a.add_argument('--repo',required=True)
     a=sub.add_parser('build',help='isolated build and verify a signed APK')
     a.add_argument('--repo',required=True);a.add_argument('--branch',required=True)
+    a.add_argument('--recipe-profile',default='auto',help='selected repository build profile')
+    a.add_argument('--recipe-file',help='approved local .pms-apk.json file for repositories without one')
     a.add_argument('--output',default=default_output());a.add_argument('--sdk',help='Android SDK root directory');a.add_argument('--type',default='auto',
         choices=('auto','flutter','capacitor','gradle','gradle-android'))
     a.add_argument('--package',help='expected Android package ID; rejects wrong Customer/Developer build variant')
@@ -127,7 +129,9 @@ def command_line() -> int:
                     raise BuildError('Signing creation not authorized')
             info=create_release(args.repo,args.branch,Path(args.output),vault,
                  project_type=args.type,allow_new_key=args.authorize_new_signing_key,log=print,
-                 sdk_root=args.sdk or load_sdk_preference(),expected_package=args.package)
+                 sdk_root=args.sdk or load_sdk_preference(),expected_package=args.package,
+                 recipe_profile=args.recipe_profile,
+                 recipe_file=Path(args.recipe_file) if args.recipe_file else None)
             print('Build success:',info['apk'])
         elif args.action=='verify-old-apk':
             fingerprint=verify_signer_against_original_apk(Path(args.apk),args.package,vault)
@@ -175,13 +179,15 @@ class PMSApp:
     def __init__(self,root:tk.Tk):
         self.root=root
         root.title('PMS APK Builder — portable v'+VERSION)
-        root.geometry('930x740')
+        root.geometry('960x810')
         root.minsize(800,610)
         self.repo=tk.StringVar()
         self.branch=tk.StringVar(value='main')
         self.output=tk.StringVar(value=default_output())
         self.sdk_root=tk.StringVar(value=load_sdk_preference())
         self.project_type=tk.StringVar(value='auto')
+        self.recipe_profile=tk.StringVar(value='auto')
+        self.recipe_file=tk.StringVar()
         self.new_key=tk.BooleanVar(value=False)
         self.package=tk.StringVar()
         self.console=queue.Queue()
@@ -202,22 +208,25 @@ class PMSApp:
         ttk.Label(g,text='Branch').grid(row=1,column=0,sticky='w',**pad)
         self.branches_cb=ttk.Combobox(g,textvariable=self.branch)
         self.branches_cb.grid(row=1,column=1,sticky='ew',**pad)
-        ttk.Label(g,text='Project type').grid(row=2,column=0,sticky='w',**pad)
+        ttk.Label(g,text='Build recipe profile').grid(row=2,column=0,sticky='w',**pad)
+        ttk.Entry(g,textvariable=self.recipe_profile).grid(row=2,column=1,sticky='ew',**pad)
+        ttk.Button(g,text='Select recipe file',command=self.choose_recipe).grid(row=2,column=2,**pad)
+        ttk.Label(g,text='Project type').grid(row=3,column=0,sticky='w',**pad)
         ttk.Combobox(g,textvariable=self.project_type,state='readonly',values=[
-            'auto','flutter','capacitor','gradle','gradle-android']).grid(row=2,column=1,sticky='ew',**pad)
-        ttk.Label(g,text='APK output').grid(row=3,column=0,sticky='w',**pad)
-        ttk.Entry(g,textvariable=self.output).grid(row=3,column=1,sticky='ew',**pad)
-        ttk.Button(g,text='Browse',command=self.choose_output).grid(row=3,column=2,**pad)
-        ttk.Label(g,text='Existing package ID / signer').grid(row=4,column=0,sticky='w',**pad)
-        ttk.Entry(g,textvariable=self.package).grid(row=4,column=1,sticky='ew',**pad)
-        ttk.Button(g,text='Saved keys',command=self.show_keys).grid(row=4,column=2,**pad)
-        ttk.Label(g,text='Android SDK folder').grid(row=5,column=0,sticky='w',**pad)
-        ttk.Entry(g,textvariable=self.sdk_root).grid(row=5,column=1,sticky='ew',**pad)
-        ttk.Button(g,text='Find / Select SDK',command=self.choose_sdk).grid(row=5,column=2,**pad)
+            'auto','flutter','capacitor','gradle','gradle-android']).grid(row=3,column=1,sticky='ew',**pad)
+        ttk.Label(g,text='APK output').grid(row=4,column=0,sticky='w',**pad)
+        ttk.Entry(g,textvariable=self.output).grid(row=4,column=1,sticky='ew',**pad)
+        ttk.Button(g,text='Browse',command=self.choose_output).grid(row=4,column=2,**pad)
+        ttk.Label(g,text='Existing package ID / signer').grid(row=5,column=0,sticky='w',**pad)
+        ttk.Entry(g,textvariable=self.package).grid(row=5,column=1,sticky='ew',**pad)
+        ttk.Button(g,text='Saved keys',command=self.show_keys).grid(row=5,column=2,**pad)
+        ttk.Label(g,text='Android SDK folder').grid(row=6,column=0,sticky='w',**pad)
+        ttk.Entry(g,textvariable=self.sdk_root).grid(row=6,column=1,sticky='ew',**pad)
+        ttk.Button(g,text='Find / Select SDK',command=self.choose_sdk).grid(row=6,column=2,**pad)
         g.columnconfigure(1,weight=1)
         ttk.Checkbutton(frame,text='Allow NEW signing key automatically if none exists (FIRST RELEASE ONLY)',
                         variable=self.new_key).pack(anchor='w',padx=12,pady=(8,8))
-        ttk.Label(frame,text='Enter https://github.com/owner/repository; choose any branch. SDK folder is auto-detected unless set.',
+        ttk.Label(frame,text='If a repository has custom native code, select its trusted recipe file before building.',
                   foreground='#46556a').pack(anchor='w',padx=12)
         ttk.Label(frame,text='Existing published app? Import its ORIGINAL signing key first. Never replace a lost signer.',
                   foreground='#a14b16').pack(anchor='w',padx=12)
@@ -290,6 +299,13 @@ class PMSApp:
         save_sdk_preference(selection)
         self.log('SDK selected: '+str(found['aapt'].parent))
 
+    def choose_recipe(self):
+        f=filedialog.askopenfilename(title='Select trusted PMS APK build recipe',
+                    filetypes=[('PMS APK recipe','*.json'),('All files','*.*')])
+        if f:
+            self.recipe_file.set(f)
+            self.log('Local build recipe selected: '+str(Path(f).name))
+
     def branches(self):
         repo=self.repo.get().strip()
         try:_,_,branch_hint=parse_repo_selection(repo)
@@ -341,10 +357,14 @@ class PMSApp:
             'A NEW signer cannot update any existing installed app signed by another key.\n\n'
             'Create a new signer only when this app has never been published or installed with another signer. Continue?'):
             return
+        selected_profile=self.recipe_profile.get().strip() or 'auto'
+        selected_recipe_file=self.recipe_file.get().strip()
         def task():
             r=create_release(repo,branch,Path(output),SigningVault(),project_type=kind,
                              allow_new_key=authorize,log=self.log,sdk_root=self.sdk_root.get(),
-                             expected_package=self.package.get().strip() or None)
+                             expected_package=self.package.get().strip() or None,
+                             recipe_profile=selected_profile,
+                             recipe_file=Path(selected_recipe_file) if selected_recipe_file else None)
             self.log('SUCCESS: '+r['apk'])
         self.worker(task,completion='apk')
 

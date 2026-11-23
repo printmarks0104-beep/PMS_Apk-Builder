@@ -136,3 +136,43 @@ To build the EXE locally (on Windows): `python -m pip install -r requirements-bu
 - App-specific build profiles/variants, multi-module selection, Google Play App Signing upload-key rules, managed signing, multiple APK splits and AAB releases require explicit per-project support and are **not** silently bypassed.
 - This project does not move application private assets or secrets from the uploaded legacy builder into the new repository. Do not put passwords, songbook keys, or API tokens in app source or this repository.
 - Always test installed APKs on an actual Android device, and verify the target app’s licensing, premium flags and payments independently; this tool does not grant or bypass entitlements.
+
+## v0.1.4 — Correct native builds via repository-owned recipes
+
+**Important change from v0.1.3:** A generic `npm ci` → Capacitor sync → Gradle build is *not* an equivalent replacement for a project's own release pipeline. Projects that ship custom Android native code must use their own checked-in `.pms-apk.json`. PMS refuses the generic route when it detects the standard `native/` plus `scripts/prepare-android.mjs` layout without a recipe, instead of producing a misleadingly small "verified" APK. Other repositories with different custom-native layouts should also add a recipe rather than relying on the generic route.
+
+The EXE still builds arbitrary **supported Android repositories and branches** without a hard-coded owner, app, or branch. Each repository owns its unique build behavior. A recipe is executable project policy; **only build trusted repos/branches** because build scripts can access repository build secrets. PMS never uploads these secrets except through the existing separate explicit Actions-secrets approval flow.
+
+A schema-1 recipe named `.pms-apk.json` belongs at the project root:
+
+```json
+{
+  "schema": 1,
+  "profiles": {
+    "release": {
+      "projectType": "capacitor",
+      "package": "com.example.app",
+      "signerSha256": null,
+      "minApkBytes": 100000,
+      "environment": { "APP_BUILD_MODE": "release" },
+      "requiredEnvironment": ["APP_PUBLIC_CONFIGURATION"],
+      "steps": {
+        "beforeSync": [["node", "scripts/check-release.mjs"]],
+        "afterSync": [["node", "scripts/prepare-android.mjs"]],
+        "beforeGradle": [],
+        "afterSign": [["node", "scripts/verify-apk.mjs", "{apk}"]]
+      }
+    }
+  }
+}
+```
+
+For **published applications**, replace `null` with the pinned **original signing certificate's 64-digit lowercase SHA-256**. PMS refuses a saved key with a different certificate **before compilation**, and will not generate another signer when the recipe pins the original. Never use a new signer to replace an old app. Your project's own profile may require additional secrets (entitlement public keys, encrypted content keys), which remain encrypted in the per-repository local vault. Profiles may define distinct Developer/Customer package IDs and preparation/verification stages; selecting the wrong profile or package fails closed.
+
+**Execution order (Capacitor):** clone a selected branch and pin the commit → choose recipe profile and verify original signer → fetch encrypted repository build secrets → `npm ci` → `npm run build` → `beforeSync` hooks → Capacitor add/sync → `afterSync` hooks → `beforeGradle` hooks → Gradle `assembleRelease` → verify package and sign with the saved key → apply minimum APK size and `afterSign` checks → reverify signer, final hash, and write the manifest. No source repository is modified; native preparation runs inside the disposable checkout. Flutter and Gradle projects can use pre-Gradle and post-sign hooks.
+
+**Use:** select an app's recipe profile in the GUI's **Build recipe profile** field (`auto` for one profile) or pass `--recipe-profile release` with CLI `build`. When more than one recipe profile is defined, choose one explicitly. The `.pms-apk.json` does not contain signing keys or passwords. It cannot silently override the toolchain, signing, or GitHub credentials. Supported command executables are `node`, `python`, `npm`, `npx`, `flutter`, `java`, and `keytool`. Command arrays are passed directly, not executed through a shell. Keep required native files and post-sign verification under source control. See `examples/pms-apk.example.json` for a generic starting point.
+
+**Security note:** The selected repository may itself run arbitrary code during npm, Gradle, Flutter, or recipe hooks. Do not supply secrets to untrusted branches. A successful EXE packaging/test run alone does not certify a project's APK on a real Android phone.
+
+For repositories that cannot or should not be changed, you can instead use a **local recipe file**: click **Select recipe file** in the EXE or pass `--recipe-file C:\path\to\trusted-recipe.json`. This applies the selected recipe to the checked-out branch without adding any file or commit to the source repository. The local path is not automatically remembered across apps, so the wrong repository's recipe cannot silently run. Never select recipes from untrusted sources. Profiles and certificate guards work identically for local and repository-owned recipes.
