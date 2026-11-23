@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import json
 from pathlib import Path
 import queue
 import sys
@@ -13,7 +14,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from pms_core import (
     VERSION, BuildError, SigningVault, create_release, detect_project,
-    remote_branches, sdk_build_tools, tool, validate_repo, validate_branch,
+    remote_branches, sdk_build_tools, tool, validate_repo, validate_branch, parse_repo_selection,
     publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root
 )
 
@@ -22,15 +23,38 @@ def default_output() -> str:
     return str(Path.home()/'Downloads'/'PMS-Verified-APKs')
 
 
+def sdk_preference_file() -> Path:
+    return vault_root()/'settings.json'
+
+
+def load_sdk_preference() -> str:
+    try:
+        cfg=json.loads(sdk_preference_file().read_text('utf8'))
+        return str(cfg.get('sdkRoot','')) if cfg.get('format')==1 else ''
+    except (OSError,ValueError,TypeError):
+        return ''
+
+
+def save_sdk_preference(directory: str) -> None:
+    # Only a non-secret directory selection is persisted; signing secrets
+    # and project build secrets stay in their separate encrypted vaults.
+    filename=sdk_preference_file()
+    filename.parent.mkdir(parents=True,exist_ok=True)
+    temporary=filename.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'format':1,'sdkRoot':directory}),encoding='utf8')
+    temporary.replace(filename)
+
+
 def command_line() -> int:
     parser=argparse.ArgumentParser(description='PMS APK Builder — Android project build/sign/reuse keys')
     sub=parser.add_subparsers(dest='action',required=True)
     a=sub.add_parser('audit',help='check build tools, no modifications')
+    a.add_argument('--sdk',help='optional Android SDK root directory')
     a=sub.add_parser('branches',help='list available GitHub branches')
     a.add_argument('--repo',required=True)
     a=sub.add_parser('build',help='isolated build and verify a signed APK')
     a.add_argument('--repo',required=True);a.add_argument('--branch',required=True)
-    a.add_argument('--output',default=default_output());a.add_argument('--type',default='auto',
+    a.add_argument('--output',default=default_output());a.add_argument('--sdk',help='Android SDK root directory');a.add_argument('--type',default='auto',
         choices=('auto','flutter','capacitor','gradle','gradle-android'))
     a.add_argument('--authorize-new-signing-key',action='store_true',
        help='first-time signer ONLY; do not use for an already released app')
@@ -61,7 +85,7 @@ def command_line() -> int:
             for name in ('git','java','keytool'):
                 try: print(f'{name}: {tool(name)}')
                 except BuildError as e:print(e)
-            try:print('Android SDK build-tools:',sdk_build_tools())
+            try:print('Android SDK build-tools:',sdk_build_tools(args.sdk or load_sdk_preference()))
             except BuildError as e:print(e)
             print('Signing vault:',vault.root)
             print('Stored signing identities:',', '.join(vault.list_packages()) or '(none)')
@@ -95,7 +119,8 @@ def command_line() -> int:
                 if input('Confirm NEW package/signer for first-time installation? Type CREATE: ')!='CREATE':
                     raise BuildError('Signing creation not authorized')
             info=create_release(args.repo,args.branch,Path(args.output),vault,
-                 project_type=args.type,allow_new_key=args.authorize_new_signing_key,log=print)
+                 project_type=args.type,allow_new_key=args.authorize_new_signing_key,log=print,
+                 sdk_root=args.sdk or load_sdk_preference())
             print('Build success:',info['apk'])
         elif args.action=='backup':
             p1=getpass.getpass('Backup passphrase (12+ characters): ')
@@ -130,11 +155,12 @@ class PMSApp:
     def __init__(self,root:tk.Tk):
         self.root=root
         root.title('PMS APK Builder — portable v'+VERSION)
-        root.geometry('790x680')
-        root.minsize(650,580)
+        root.geometry('845x730')
+        root.minsize(750,610)
         self.repo=tk.StringVar()
         self.branch=tk.StringVar(value='main')
         self.output=tk.StringVar(value=default_output())
+        self.sdk_root=tk.StringVar(value=load_sdk_preference())
         self.project_type=tk.StringVar(value='auto')
         self.new_key=tk.BooleanVar(value=False)
         self.package=tk.StringVar()
@@ -165,9 +191,14 @@ class PMSApp:
         ttk.Label(g,text='Existing package ID / signer').grid(row=4,column=0,sticky='w',**pad)
         ttk.Entry(g,textvariable=self.package).grid(row=4,column=1,sticky='ew',**pad)
         ttk.Button(g,text='Saved keys',command=self.show_keys).grid(row=4,column=2,**pad)
+        ttk.Label(g,text='Android SDK folder').grid(row=5,column=0,sticky='w',**pad)
+        ttk.Entry(g,textvariable=self.sdk_root).grid(row=5,column=1,sticky='ew',**pad)
+        ttk.Button(g,text='Find / Select SDK',command=self.choose_sdk).grid(row=5,column=2,**pad)
         g.columnconfigure(1,weight=1)
         ttk.Checkbutton(frame,text='Allow NEW signing key automatically if none exists (FIRST RELEASE ONLY)',
                         variable=self.new_key).pack(anchor='w',padx=12,pady=(8,8))
+        ttk.Label(frame,text='Enter https://github.com/owner/repository; choose any branch. SDK folder is auto-detected unless set.',
+                  foreground='#46556a').pack(anchor='w',padx=12)
         ttk.Label(frame,text='Existing published app? Import its ORIGINAL signing key first. Never replace a lost signer.',
                   foreground='#a14b16').pack(anchor='w',padx=12)
         buttons=ttk.Frame(frame);buttons.pack(fill='x',pady=12)
@@ -201,11 +232,13 @@ class PMSApp:
                 elif op=='done':
                     self.busy=False
                     self.buildbutton.configure(state='normal')
-                    if value:messagebox.showinfo('PMS APK Builder','Verified APK completed.')
+                    success,kind=value
+                    if success and kind=='apk':
+                        messagebox.showinfo('PMS APK Builder','Signed APK built and verified.')
         except queue.Empty:pass
         self.root.after(90,self.consume)
 
-    def worker(self,task):
+    def worker(self,task,*,completion='task'):
         if self.busy:
             messagebox.showwarning('Busy','A build or branch request is already running.');return
         self.busy=True
@@ -215,26 +248,48 @@ class PMSApp:
             try:task();ok=True
             except BuildError as e:self.log('SAFE STOP: '+str(e))
             except Exception as e:self.log('SAFE STOP: unexpected error ('+type(e).__name__+'). No APK declared verified.')
-            finally:self.console.put(('done',ok))
+            finally:self.console.put(('done',(ok,completion)))
         threading.Thread(target=job,daemon=True).start()
 
     def choose_output(self):
         p=filedialog.askdirectory(initialdir=self.output.get() if Path(self.output.get()).exists() else str(Path.home()))
         if p:self.output.set(p)
 
+    def choose_sdk(self):
+        selection=filedialog.askdirectory(title='Select Android SDK root (contains build-tools)',
+             initialdir=self.sdk_root.get() if self.sdk_root.get() and Path(self.sdk_root.get()).is_dir() else str(Path.home()))
+        if not selection:return
+        try:
+            found=sdk_build_tools(selection)
+        except BuildError as err:
+            messagebox.showwarning('Android SDK folder',str(err));return
+        self.sdk_root.set(selection)
+        save_sdk_preference(selection)
+        self.log('SDK selected: '+str(found['aapt'].parent))
+
     def branches(self):
-        repo=self.repo.get()
+        repo=self.repo.get().strip()
+        try:_,_,branch_hint=parse_repo_selection(repo)
+        except BuildError as err:
+            messagebox.showwarning('GitHub repository',str(err));return
+
         def task():
             names=remote_branches(repo)
             self.log(f'Found {len(names)} branches')
-            self.root.after(0,lambda:self.branches_cb.configure(values=names))
+            def set_branches():
+                self.branches_cb.configure(values=names)
+                if branch_hint and branch_hint in names:
+                    self.branch.set(branch_hint)
+                elif names and self.branch.get() not in names:
+                    self.branch.set('main' if 'main' in names else names[0])
+            self.root.after(0,set_branches)
         self.worker(task)
 
     def audit(self):
         for name in ('git','java','keytool','flutter','npm','gh'):
             try:self.log(name+': '+tool(name))
             except BuildError:self.log(name+': not installed (may be optional)')
-        try:self.log('Android SDK build-tools: '+str(sdk_build_tools()))
+        try:self.log('Android SDK build-tools: '+str(sdk_build_tools(self.sdk_root.get())))
         except BuildError as e:self.log('SDK: '+str(e))
         self.show_keys()
 
@@ -249,7 +304,15 @@ class PMSApp:
         return package
 
     def build(self):
-        repo=self.repo.get();branch=self.branch.get();output=self.output.get();kind=self.project_type.get()
+        repo=self.repo.get().strip();branch=self.branch.get().strip();output=self.output.get();kind=self.project_type.get()
+        try:
+            _,_,branch_hint=parse_repo_selection(repo)
+            if branch_hint and (not branch or branch=='main'):
+                branch=branch_hint
+                self.branch.set(branch_hint)
+            validate_branch(branch)
+        except BuildError as err:
+            messagebox.showwarning('Select a GitHub repository and branch',str(err));return
         authorize=self.new_key.get()
         if authorize and not messagebox.askyesno('First-release signing ONLY',
             'A NEW signer cannot update any existing installed app signed by another key.\n\n'
@@ -257,9 +320,9 @@ class PMSApp:
             return
         def task():
             r=create_release(repo,branch,Path(output),SigningVault(),project_type=kind,
-                             allow_new_key=authorize,log=self.log)
+                             allow_new_key=authorize,log=self.log,sdk_root=self.sdk_root.get())
             self.log('SUCCESS: '+r['apk'])
-        self.worker(task)
+        self.worker(task,completion='apk')
 
     def import_key(self):
         package=self.require_package()

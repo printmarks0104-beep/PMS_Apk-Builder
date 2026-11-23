@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -32,17 +32,42 @@ class BuildError(Exception):
     """Expected fail-closed error; credentials must not be included in messages."""
 
 
-def validate_repo(value: str) -> tuple[str, str]:
-    """Limit remote build inputs to explicitly selected GitHub repositories."""
-    m = GITHUB_RE.fullmatch(value.strip())
-    if not m or m.group(1).startswith('-') or m.group(2).startswith('-'):
-        raise BuildError('Enter an HTTPS GitHub URL such as https://github.com/owner/repository')
-    owner, name = m.group(1), m.group(2)
-    if name.endswith('.git'):
-        name = name[:-4]
-    if not name or name in ('.', '..') or '..' in name:
+def parse_repo_selection(value: str) -> tuple[str, str, str | None]:
+    """Understand a GitHub repo URL or a GitHub browser branch URL.
+
+    A branch URL has /tree/<branch>, including slash-separated branch names.
+    Reject credentials, fragments, query strings, escape codes and other hosts.
+    """
+    input_url=str(value).strip()
+    parsed=urlparse(input_url)
+    if (parsed.scheme!='https' or parsed.netloc.lower()!='github.com' or
+            parsed.username or parsed.password or parsed.port or
+            parsed.query or parsed.fragment or '%' in parsed.path):
+        raise BuildError('Enter a GitHub repository URL: https://github.com/owner/repository '
+                         '(a /tree/branch link also works)')
+    path=parsed.path.strip('/')
+    components=path.split('/')
+    if len(components) < 2:
+        raise BuildError('Enter the GitHub repository URL including owner and repository')
+    owner,repo=components[:2]
+    if not re.fullmatch(r'[A-Za-z0-9-]+',owner) or owner.startswith('-') or \
+       not re.fullmatch(r'[A-Za-z0-9_.-]+',repo) or repo.startswith('-'):
+        raise BuildError('Invalid GitHub repository URL')
+    if repo.endswith('.git'):repo=repo[:-4]
+    if not repo or repo in ('.','..') or '..' in repo:
         raise BuildError('Invalid GitHub repository name')
-    return f'https://github.com/{owner}/{name}.git', f'{owner}/{name}'
+    branch=None
+    if len(components)>2:
+        if len(components)<4 or components[2]!='tree':
+            raise BuildError('Use a repository URL or its GitHub /tree/branch link')
+        branch=validate_branch('/'.join(components[3:]))
+    return f'https://github.com/{owner}/{repo}.git', f'{owner}/{repo}', branch
+
+
+def validate_repo(value: str) -> tuple[str, str]:
+    """Restrict clones to HTTPS GitHub repository URLs."""
+    clone,slug,_=parse_repo_selection(value)
+    return clone,slug
 
 
 def validate_branch(name: str) -> str:
@@ -308,18 +333,68 @@ class SigningVault:
             raise BuildError('Backup decryption failed or backup was modified') from e
 
 
-def sdk_build_tools() -> dict[str,Path]:
-    roots=[os.environ.get('ANDROID_SDK_ROOT'),os.environ.get('ANDROID_HOME')]
-    home=Path.home();roots.extend([str(home/'AppData/Local/Android/Sdk'),str(home/'Android/Sdk')])
-    for root in filter(None, roots):
-        build=Path(root)/'build-tools'
+def sdk_candidates(configured: str | Path | None = None) -> list[Path]:
+    """Locate Android SDK installations without touching installed tools.
+
+    A user-selected SDK directory wins; otherwise follow official environment
+    settings and the normal Android Studio paths for Windows and other OSes.
+    """
+    if configured and str(configured).strip():
+        return [Path(str(configured).strip().strip('"')).expanduser()]
+    home=Path.home()
+    values=[os.environ.get('PMS_ANDROID_SDK_ROOT'),os.environ.get('ANDROID_SDK_ROOT'),
+            os.environ.get('ANDROID_HOME')]
+    local=os.environ.get('LOCALAPPDATA')
+    if local:values.append(str(Path(local)/'Android'/'Sdk'))
+    profile=os.environ.get('USERPROFILE')
+    if profile:values.append(str(Path(profile)/'AppData'/'Local'/'Android'/'Sdk'))
+    values.extend([str(home/'AppData'/'Local'/'Android'/'Sdk'),
+                   str(home/'Android'/'Sdk'),str(home/'Android'/'sdk'),
+                   str(home/'Library'/'Android'/'sdk')])
+    roots=[];seen=set()
+    for raw in values:
+        if not raw:continue
+        path=Path(raw.strip().strip('"')).expanduser()
+        key=os.path.normcase(str(path))
+        if key not in seen:roots.append(path);seen.add(key)
+    return roots
+
+
+def sdk_tool_paths(directory: Path, *, windows: bool | None = None) -> dict[str,Path]:
+    """Resolve platform-specific build-tool names, especially apksigner.bat.
+
+    A complete *single* SDK version must supply all 3 executables; never mix
+    tools from separate versions or directories.
+    """
+    if windows is None:windows=os.name=='nt'
+    def choose(stem: str) -> Path:
+        suffixes=('.bat','.exe') if stem=='apksigner' and windows else \
+                 ('.exe',) if windows else ('',)
+        for suffix in suffixes:
+            candidate=directory/(stem+suffix)
+            if candidate.is_file():return candidate
+        return directory/(stem+suffixes[0])
+    return {stem:choose(stem) for stem in ('aapt','zipalign','apksigner')}
+
+
+def sdk_build_tools(configured: str | Path | None = None, *, windows: bool | None = None) -> dict[str,Path]:
+    """Discover a complete SDK Build Tools release; read-only and fail-closed."""
+    roots=sdk_candidates(configured)
+    for root in roots:
+        build=root/'build-tools'
         if not build.is_dir():continue
         versions=sorted((x for x in build.iterdir() if x.is_dir()),
-                        key=lambda x: tuple(int(y) for y in re.findall(r'\d+',x.name)),reverse=True)
-        for v in versions:
-            tools={n:v/(n+'.exe' if os.name=='nt' else n) for n in ('aapt','zipalign','apksigner')}
-            if all(x.is_file() for x in tools.values()):return tools
-    raise BuildError('Android SDK build-tools missing: require aapt, zipalign and apksigner')
+            key=lambda x: (not bool(re.search(r'(?:alpha|beta|rc)',x.name,re.I)),
+                           tuple(int(y) for y in re.findall(r'\d+',x.name))),reverse=True)
+        for version in versions:
+            found=sdk_tool_paths(version, windows=windows)
+            if all(file.is_file() for file in found.values()):return found
+    searched=', '.join(str(x) for x in roots[:5]) or '(no SDK paths)'
+    raise BuildError('Android SDK Build Tools not found or incomplete. '
+                     'On Windows the required files are aapt.exe, zipalign.exe and '
+                     'apksigner.bat. Select your Android SDK folder in the builder '
+                     '(not the build-tools/version folder), or install Build Tools '
+                     'using Android Studio > SDK Manager. Searched: '+searched)
 
 
 def apk_package(apk: Path, sdk: dict[str,Path]) -> str:
@@ -433,9 +508,10 @@ def remote_branches(repo:str)->list[str]:
 
 
 def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
-                   project_type='auto',allow_new_key=False,log=None) -> dict:
+                   project_type='auto',allow_new_key=False,log=None, sdk_root=None) -> dict:
     repo_url,repo_name=validate_repo(repo);branch=validate_branch(branch)
-    sdk=sdk_build_tools()
+    sdk=sdk_build_tools(sdk_root)
+    if log:log('Android SDK Build Tools found at: '+str(sdk['aapt'].parent))
     with tempfile.TemporaryDirectory(prefix='pms-android-build-') as work:
         src=Path(work)/'source'
         sha=clone_branch(repo_url,branch,src,log=log)

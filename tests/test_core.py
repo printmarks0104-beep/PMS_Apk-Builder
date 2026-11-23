@@ -132,4 +132,78 @@ class SigningTests(unittest.TestCase):
         with self.assertRaises(core.BuildError):target.restore(dest,'a-strong-test-passphrase')
 
 
+
+
+class PortableSdkRegressionTests(unittest.TestCase):
+    """Read-only SDK checks reproduce Windows SDK folder layouts on all CI hosts."""
+
+    def make_sdk(self, root, version='35.0.0', *, windows=True, complete=True):
+        sdk=Path(root)/'build-tools'/version
+        sdk.mkdir(parents=True)
+        suffix='.exe' if windows else ''
+        for tool in ('aapt','zipalign'):
+            (sdk/(tool+suffix)).write_text('placeholder')
+        if complete:
+            (sdk/('apksigner.bat' if windows else 'apksigner')).write_text('placeholder')
+        return sdk
+
+    def test_windows_apksigner_bat_is_required_not_exe(self):
+        with tempfile.TemporaryDirectory() as d:
+            sdk=self.make_sdk(d)
+            found=core.sdk_tool_paths(sdk,windows=True)
+            self.assertEqual(found['apksigner'].name,'apksigner.bat')
+            self.assertTrue(all(p.is_file() for p in found.values()))
+            (sdk/'apksigner.bat').unlink()
+            self.assertFalse(all(p.is_file() for p in core.sdk_tool_paths(sdk,windows=True).values()))
+
+    def test_explicit_root_and_fallback_between_incomplete_sdk_versions(self):
+        with tempfile.TemporaryDirectory() as d:
+            full=self.make_sdk(d,'34.0.0',windows=True)
+            self.make_sdk(d,'35.0.0',windows=True,complete=False)
+            found=core.sdk_build_tools(d,windows=True)
+            self.assertEqual(found['aapt'].parent,full)
+            self.assertEqual(found['apksigner'].name,'apksigner.bat')
+
+    def test_explicit_sdk_root_never_silently_falls_back_elsewhere(self):
+        with tempfile.TemporaryDirectory() as d:
+            one=Path(d)/'wrong'
+            two=Path(d)/'real'
+            self.make_sdk(two,windows=True)
+            with patch.dict(os.environ,{'ANDROID_SDK_ROOT':str(two)}):
+                with self.assertRaisesRegex(core.BuildError,'Select your Android SDK'):
+                    core.sdk_build_tools(one)
+
+    def test_android_sdk_from_localappdata_and_alternative_profile(self):
+        with tempfile.TemporaryDirectory() as d:
+            local=Path(d)/'AppData'/'Local'
+            expected=local/'Android'/'Sdk'
+            self.make_sdk(expected,windows=True)
+            with patch.dict(os.environ,{'LOCALAPPDATA':str(local), 'ANDROID_SDK_ROOT':'',
+                'ANDROID_HOME':'', 'PMS_ANDROID_SDK_ROOT':''}):
+                self.assertIn(expected,core.sdk_candidates())
+
+    def test_browser_tree_link_extracts_branch_without_relaxing_origin(self):
+        clone,slug,branch=core.parse_repo_selection(
+            'https://github.com/owner/example-repo/tree/feature/premium-glass-2026')
+        self.assertEqual((clone,slug,branch),(
+            'https://github.com/owner/example-repo.git','owner/example-repo','feature/premium-glass-2026'))
+        self.assertEqual(core.validate_repo('https://github.com/owner/example-repo/tree/main'),
+                         (clone,slug))
+        for value in ('https://github.com/owner/repo/blob/main/file',
+                      'https://github.com/owner/repo/tree/a/../b',
+                      'https://github.com/owner/repo/tree/a?token=123',
+                      'https://github.com/owner/repo/tree/a%2Fb',
+                      'https://github.com.evil.com/owner/repo/tree/main'):
+            with self.subTest(value=value),self.assertRaises(core.BuildError):
+                core.parse_repo_selection(value)
+
+    def test_sdk_failure_does_not_create_or_regenerate_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            original=Path(d)/'signing'
+            vault=core.SigningVault(original)
+            with self.assertRaisesRegex(core.BuildError,'Android SDK Build Tools'):
+                core.create_release('https://github.com/owner/repo','main',Path(d),
+                                    vault,sdk_root=Path(d)/'missing-sdk')
+            self.assertFalse(original.exists())
+
 if __name__=='__main__':unittest.main()

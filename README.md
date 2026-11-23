@@ -6,7 +6,7 @@
 
 Open [Actions → Build portable Windows EXE](https://github.com/printmarks0104-beep/PMS_Apk-Builder/actions/workflows/portable-exe.yml), run the workflow or choose the most recent successful run, then download `PMS-Apk-Builder-Windows-Portable`. Extract it and open **`PMS-Apk-Builder.exe`**. **No Python installation is needed** on the destination PC. The EXE does not write to Program Files or require an installer.
 
-**External toolchains are still required**: Git, JDK with `keytool`, Android SDK build-tools (`aapt`, `zipalign`, `apksigner`), and one framework toolchain (Flutter, Node/npm with Capacitor, or the repository's Gradle wrapper). Those tools are not bundled inside the portable EXE. Flutter/Capacitor/Gradle projects can require additional Android SDK platform/build packages, licenses or local Java configuration. A standalone EXE cannot make an unsupported repository into an Android app.
+**External toolchains are still required**: Git, JDK with `keytool`, Android SDK Build Tools (`aapt.exe`, `zipalign.exe`, `apksigner.bat` on Windows), and one framework toolchain (Flutter, Node/npm with Capacitor, or the repository's Gradle wrapper). Those tools are not bundled inside the portable EXE. Flutter/Capacitor/Gradle projects can require additional Android SDK platform/build packages, licenses or local Java configuration. A standalone EXE cannot make an unsupported repository into an Android app.
 
 ## What it supports
 
@@ -17,6 +17,20 @@ Open [Actions → Build portable Windows EXE](https://github.com/printmarks0104-
 | Gradle Android application | repository `gradlew[.bat] assembleRelease` | JDK, Android SDK |
 
 The builder signs the **final APK** using the same saved PKCS12 identity for that Android application ID. It checks zip alignment, Android package ID, signer certificate SHA-256, apksigner verification and final file SHA-256, then saves a provenance JSON manifest. It refuses to guess when a project builds multiple APKs or variants. Version codes/names, SDK compatibility, flavor, permissions and release behavior are controlled by the selected repository; adjust and test them there. An APK build does **not** imply the application works on a device.
+
+
+## Fix for “Android SDK Build Tools missing” on Windows
+
+**v0.1.1 corrects a Windows-specific detection bug.** Official Windows Android SDK Build Tools commonly contain `aapt.exe`, `zipalign.exe`, **`apksigner.bat`**, not `apksigner.exe`. Previous versions incorrectly looked only for `.exe` and could report missing SDK tools on a configured Windows PC.
+
+- Click **Audit tools** to see discovery results. PMS checks `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `%LOCALAPPDATA%\Android\Sdk`, and other normal SDK locations, using one complete Build Tools version rather than mixing binaries from different versions.
+- Click **Find / Select SDK**, and select a directory such as `C:\Users\Administrator\AppData\Local\Android\Sdk` **not** its `build-tools\35.0.0` child. This persists only your SDK root path, not any key.
+- If the necessary tools are genuinely missing, use **Android Studio → Settings → Android SDK → SDK Tools → Android SDK Build-Tools**, or use the official SDK command-line tools `sdkmanager` to install a compatible release and accept Android SDK licenses. PMS never silently installs system tools or changes system SDK paths.
+- CLI: `python pms_builder.py audit --sdk "C:\Users\Administrator\AppData\Local\Android\Sdk"` and `python pms_builder.py build --repo https://github.com/owner/repo --branch main --sdk "C:\Users\Administrator\AppData\Local\Android\Sdk" --output "C:\VerifiedAPKs"`.
+- A **GitHub branch URL** such as `https://github.com/owner/repo/tree/feature/new-ui` is accepted; a GitHub file URL or link containing a query string is deliberately rejected. GitHub authentication and repo access are still necessary.
+- A successful **Get branches** only proves the branch lookup worked. It never declares an APK verified. Only a completed build, signing and certificate verification can do that.
+
+Documentation: [Android SDK Manager](https://developer.android.com/tools/sdkmanager) and [Build apps from the command line](https://developer.android.com/build/building-cmdline).
 
 ## Signing keys: important
 
@@ -35,8 +49,8 @@ Use **Backup build secrets** to create a separately encrypted `.pmsenv` file for
 
 ## User workflow
 
-1. Launch `PMS-Apk-Builder.exe`. Select your `https://github.com/owner/repo`, then **Get branches**, and choose a branch.
-2. Use **Audit tools** to see missing dependencies. Set output folder and leave project type as **auto** unless needed.
+1. Launch `PMS-Apk-Builder.exe`. Enter your `https://github.com/owner/repo` **or** a GitHub browser link ending in `/tree/your/branch`; then **Get branches** and select the intended branch. The picker recognizes links with a branch name.
+2. Use **Audit tools** to see missing dependencies. If the SDK is installed at a nonstandard location, click **Find / Select SDK** and choose the **SDK root** directory (the folder that contains `build-tools`). This non-secret folder preference is saved for the current Windows user. Set output folder and leave project type as **auto** unless needed.
 3. If updating an existing app, **Import key** first; otherwise authorize automatic creation for a truly new app.
 4. **BUILD AND VERIFY APK**. An APK is declared successful only if build, signing, certificate and package validation all pass.
 5. Immediately export an **encrypted signing backup**, store it off-PC, and confirm you can restore it on a separate test PC before publishing your app.
