@@ -75,6 +75,37 @@ Nothing is uploaded to GitHub by a local build. The repository can be public or 
 
 The **GitHub secrets** button or `github-secrets` CLI action requires an explicit warning confirmation. It uses an authenticated `gh` CLI and uploads through STDIN, never command-line arguments. It writes `PMS_SIGNING_P12_BASE64`, `PMS_SIGNING_PASSWORD`, `PMS_SIGNING_ALIAS`, `PMS_SIGNING_PACKAGE`, and `PMS_SIGNING_CERT_SHA256` to the **selected application repository's Actions secrets**, not PMS APK Builder itself. Only configure this in a repository whose maintainers/workflows you trust. Avoid exposing Actions secrets to forked pull requests or untrusted build scripts. GitHub won't reveal the secret values back to you. With explicit approval it can also upload the encrypted local project environment-secret values as GitHub Actions secrets. This tool does not automatically add a signing workflow to the application repo.
 
+## Signing preflight and certificate comparison (v0.1.3)
+
+When the selected project contains an unambiguous literal Android application ID,
+PMS checks the **existing local signing vault before `npm ci`, Flutter, or Gradle**.
+This prevents waiting through a successful compile only to discover that the
+original signing key is missing. Dynamic application IDs and product flavors
+may not be resolvable statically; in that case PMS checks the actual compiled
+APK ID before signing, as before.
+
+**Existing installed apps:** enter the expected Android package ID in the GUI
+before building; this must match the selected variant. Click **Find signing keys**,
+choose a candidate, and **Import key** with its actual alias/password. If you
+have the prior signed APK, click **Compare signer vs old APK** and select that
+APK. PMS verifies its package and certificate SHA-256 against the saved signer
+and refuses a mismatch. Neither an old APK nor a matching filename reveals
+or recovers a lost signing private key.
+
+The generic Capacitor/Gradle/Flutter build route does **not** reproduce custom
+application-specific release pipelines or enable special Developer/Customer
+build profiles on its own. In particular, a `com.example.app` Customer build is
+not a `com.example.app.dev` Developer APK. Select the intended repo branch,
+app variant, package ID and original signing identity; never publish the wrong
+variant, or substitute a newly generated signer for an existing installed app.
+
+CLI examples:
+
+```powershell
+python pms_builder.py build --repo https://github.com/owner/app --branch main --package com.example.app
+python pms_builder.py verify-old-apk --package com.example.app --apk C:\Backups\OldSigned.apk
+```
+
 ## CLI / local development
 
 ```powershell

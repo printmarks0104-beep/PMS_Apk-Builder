@@ -362,3 +362,84 @@ class ReleaseSdkHandoffTests(unittest.TestCase):
                 result=core.create_release('https://github.com/owner/project','main',root/'output',mocked_vault)
             self.assertEqual(len(env_seen),1)
             self.assertEqual(result['projectType'],'gradle-android')
+
+
+class SigningPreflightTests(unittest.TestCase):
+    def test_literal_capacitor_package_hint_and_dynamic_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            ts=root/'capacitor.config.ts'
+            ts.write_text("import type {CapacitorConfig} from '@capacitor/cli';\n"
+                          "const config:CapacitorConfig={appId:'com.mjranuda.karaokey',appName:'Test'};\n"
+                          "export default config;\n",encoding='utf8')
+            self.assertEqual(core.source_package_hint(root,'capacitor'),'com.mjranuda.karaokey')
+            ts.write_text("const config={appId:process.env.APP_ID};\n",encoding='utf8')
+            self.assertIsNone(core.source_package_hint(root,'capacitor'))
+            ts.unlink()
+            (root/'capacitor.config.json').write_text('{"appId":"com.example.other"}',encoding='utf8')
+            self.assertEqual(core.source_package_hint(root,'capacitor'),'com.example.other')
+
+    def test_gradle_hint_skips_flavors_and_suffixes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            gradle=root/'android'/'app'/'build.gradle'
+            gradle.parent.mkdir(parents=True)
+            gradle.write_text("android { defaultConfig { applicationId 'com.example.app' } }",encoding='utf8')
+            self.assertEqual(core.source_package_hint(root,'gradle-android'),'com.example.app')
+            gradle.write_text("android { defaultConfig { applicationId 'com.example.app' } "
+                              "productFlavors { dev { applicationIdSuffix '.dev' } } }",encoding='utf8')
+            self.assertIsNone(core.source_package_hint(root,'gradle-android'))
+
+    def test_preflight_detects_missing_signer_before_any_build(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            sdk=root/'sdk'/'build-tools'/'36.0.0'
+            sdk.mkdir(parents=True)
+            stub={'aapt':sdk/'aapt.exe','zipalign':sdk/'zipalign.exe','apksigner':sdk/'apksigner.bat'}
+            def clone(repo,branch,checkout,log=None):
+                checkout.mkdir()
+                (checkout/'package.json').write_text('{}')
+                (checkout/'capacitor.config.ts').write_text("export default {appId:'com.example.existing'}")
+                return 'a'*40
+            with patch.object(core,'sdk_build_tools',return_value=stub),\
+                 patch.object(core,'clone_branch',side_effect=clone),\
+                 patch.object(core,'build_source',side_effect=AssertionError('build must not run')),\
+                 patch.object(core.SecretVault,'values',side_effect=AssertionError('secret lookup must not run')):
+                vault=MagicMock()
+                vault.load.return_value=None
+                with self.assertRaisesRegex(core.BuildError,'BEFORE npm/Gradle'):
+                    core.create_release('https://github.com/owner/project','main',root/'out',vault)
+                self.assertEqual(vault.load.call_args.args[0],'com.example.existing')
+
+    def test_selected_package_must_match_source_even_with_new_signing_approval(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            (root/'capacitor.config.ts').write_text("const config={appId:'com.example.customer'};")
+            vault=MagicMock()
+            with self.assertRaisesRegex(core.BuildError,'does not match source application ID'):
+                core.preflight_signer(root,'capacitor',vault,expected_package='com.example.dev',allow_new_key=True)
+            vault.load.assert_not_called()
+
+    def test_imported_signer_matches_old_apk_or_stops(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as td:
+            apk=Path(td)/'old-signed.apk';apk.write_bytes(b'fixture')
+            vault=MagicMock()
+            vault.load.return_value=core.Identity('com.example.customer','myalias','f'*64,
+                                                   Path(td)/'saved.p12','test')
+            fake_sdk={k:Path(td)/k for k in ('aapt','zipalign','apksigner')}
+            with patch.object(core,'apk_package',return_value='com.example.customer'),\
+                 patch.object(core,'run',return_value='Signer #1 certificate SHA-256 digest: '+'f'*64):
+                fingerprint=core.verify_signer_against_original_apk(
+                    apk,'com.example.customer',vault,sdk=fake_sdk)
+                self.assertEqual(fingerprint,'f'*64)
+            with patch.object(core,'apk_package',return_value='com.example.customer'),\
+                 patch.object(core,'run',return_value='Signer #1 certificate SHA-256 digest: '+'e'*64):
+                with self.assertRaisesRegex(core.BuildError,'SIGNER MISMATCH'):
+                    core.verify_signer_against_original_apk(apk,'com.example.customer',vault,sdk=fake_sdk)
+            with patch.object(core,'apk_package',return_value='com.example.dev'),\
+                 patch.object(core,'run',side_effect=AssertionError('should not verify unrelated APK')):
+                with self.assertRaisesRegex(core.BuildError,'package does not match'):
+                    core.verify_signer_against_original_apk(apk,'com.example.customer',vault,sdk=fake_sdk)

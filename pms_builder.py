@@ -14,7 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from pms_core import (
     VERSION, BuildError, SigningVault, create_release, detect_project,
-    remote_branches, sdk_build_tools, tool, validate_repo, validate_branch, parse_repo_selection,
+    remote_branches, sdk_build_tools, tool, validate_repo, validate_branch,
+    verify_signer_against_original_apk, parse_repo_selection,
     publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root,
     discover_signing_keys
 )
@@ -57,8 +58,11 @@ def command_line() -> int:
     a.add_argument('--repo',required=True);a.add_argument('--branch',required=True)
     a.add_argument('--output',default=default_output());a.add_argument('--sdk',help='Android SDK root directory');a.add_argument('--type',default='auto',
         choices=('auto','flutter','capacitor','gradle','gradle-android'))
+    a.add_argument('--package',help='expected Android package ID; rejects wrong Customer/Developer build variant')
     a.add_argument('--authorize-new-signing-key',action='store_true',
        help='first-time signer ONLY; do not use for an already released app')
+    a=sub.add_parser('verify-old-apk',help='compare imported signer with a previously signed APK')
+    a.add_argument('--package',required=True);a.add_argument('--apk',required=True)
     a=sub.add_parser('find-keys',help='read-only search for existing signing keystores')
     a.add_argument('--folder',help='optional custom folder or drive to scan')
     a=sub.add_parser('keys',help='show package names with existing saved identities')
@@ -123,8 +127,11 @@ def command_line() -> int:
                     raise BuildError('Signing creation not authorized')
             info=create_release(args.repo,args.branch,Path(args.output),vault,
                  project_type=args.type,allow_new_key=args.authorize_new_signing_key,log=print,
-                 sdk_root=args.sdk or load_sdk_preference())
+                 sdk_root=args.sdk or load_sdk_preference(),expected_package=args.package)
             print('Build success:',info['apk'])
+        elif args.action=='verify-old-apk':
+            fingerprint=verify_signer_against_original_apk(Path(args.apk),args.package,vault)
+            print('MATCH: Original APK and saved signing identity share certificate SHA-256:',fingerprint)
         elif args.action=='find-keys':
             scan=discover_signing_keys([Path(args.folder)] if args.folder else None)
             print(f'Found {len(scan.candidates)} candidate signing key files '
@@ -222,6 +229,8 @@ class PMSApp:
                          ('Restore key',self.restore)]:
             ttk.Button(buttons,text=label,command=fn).pack(side='left',padx=3)
         secrets_buttons=ttk.Frame(frame);secrets_buttons.pack(fill='x',pady=(0,10))
+        ttk.Button(secrets_buttons,text='Compare signer vs old APK',
+                   command=self.verify_original_apk).pack(side='left',padx=3)
         for label,fn in [('Save build secret',self.save_build_secret),
                          ('Backup build secrets',self.backup_build_secrets),
                          ('GitHub Actions secrets',self.github_secrets)]:
@@ -334,7 +343,8 @@ class PMSApp:
             return
         def task():
             r=create_release(repo,branch,Path(output),SigningVault(),project_type=kind,
-                             allow_new_key=authorize,log=self.log,sdk_root=self.sdk_root.get())
+                             allow_new_key=authorize,log=self.log,sdk_root=self.sdk_root.get(),
+                             expected_package=self.package.get().strip() or None)
             self.log('SUCCESS: '+r['apk'])
         self.worker(task,completion='apk')
 
@@ -418,6 +428,18 @@ class PMSApp:
             if key_password is None:return
         self.worker(lambda:self.log('Imported original signer: '+SigningVault().import_existing(
             package,Path(file),alias,password,key_password=key_password).fingerprint))
+
+    def verify_original_apk(self):
+        package=self.require_package()
+        if not package:return
+        selected=filedialog.askopenfilename(title='Select old VERIFIED APK of the same package',
+              filetypes=[('Android APK','*.apk'),('All files','*.*')])
+        if not selected:return
+        def job():
+            fingerprint=verify_signer_against_original_apk(Path(selected),package,SigningVault(),
+                sdk=sdk_build_tools(self.sdk_root.get()))
+            self.log('MATCH: Original APK and saved signer have the same certificate: '+fingerprint)
+        self.worker(job)
 
     def backup(self):
         package=self.require_package()

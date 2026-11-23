@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -542,6 +542,94 @@ def apk_package(apk: Path, sdk: dict[str,Path]) -> str:
     return validate_package_id(m.group(1))
 
 
+
+def source_package_hint(root: Path, project_type: str) -> str | None:
+    """Detect only a literal, unambiguous application ID without executing source code.
+
+    This is a *pre-build convenience*, never a substitute for reading the
+    actual compiled APK ID. Projects with product flavors/dynamic IDs are
+    deliberately deferred until post-build verification.
+    """
+    root=Path(root)
+    if project_type=='capacitor':
+        config=root/'capacitor.config.json'
+        if config.is_file() and config.stat().st_size<=256*1024:
+            try:
+                value=json.loads(config.read_text('utf8')).get('appId')
+                return validate_package_id(value) if isinstance(value,str) else None
+            except (ValueError,UnicodeError,TypeError,BuildError):return None
+        config=root/'capacitor.config.ts'
+        if config.is_file() and config.stat().st_size<=256*1024:
+            try:text=config.read_text('utf8')
+            except UnicodeError:return None
+            # Supports common Capacitor literal config. Never evaluate JS/TS.
+            matches=re.findall(r"""\bappId\s*:\s*(['"])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\1""",text)
+            if len(matches)==1:
+                try:return validate_package_id(matches[0][1])
+                except BuildError:return None
+        return None
+    if project_type not in ('flutter','gradle','gradle-android'):
+        return None
+    folder=root if project_type=='gradle' else root/'android'
+    for filename in ('app/build.gradle','app/build.gradle.kts'):
+        config=folder/filename
+        if not config.is_file() or config.stat().st_size>256*1024:continue
+        try:text=config.read_text('utf8')
+        except UnicodeError:continue
+        # Product flavors or suffixes may change application ID dynamically.
+        if re.search(r'\b(productFlavors|applicationIdSuffix)\b',text):return None
+        matches=re.findall(r"""\bapplicationId\s*(?:=\s*)?(['"])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+)\1""",text)
+        if len(matches)==1:
+            try:return validate_package_id(matches[0][1])
+            except BuildError:return None
+    return None
+
+
+def preflight_signer(source: Path, project_type: str, vault: SigningVault, *,
+                     expected_package: str | None = None, allow_new_key=False,
+                     log=None) -> str | None:
+    """Reject a missing signer before expensive builds when the ID is known."""
+    if expected_package:
+        expected_package=validate_package_id(expected_package)
+    inferred=source_package_hint(source,project_type)
+    if inferred and expected_package and inferred.lower()!=expected_package.lower():
+        raise BuildError('Selected package ID '+expected_package+' does not match source application ID '+
+                         inferred+'. Check the intended Customer/Developer variant before building.')
+    candidate=inferred or expected_package
+    if candidate and not allow_new_key:
+        signer=vault.load(candidate)
+        if signer is None:
+            raise BuildError('Signing preflight: no saved signer for '+candidate+
+                '. Build stopped BEFORE npm/Gradle. Use Find signing keys, import the ORIGINAL key, '+
+                'and compare it with your previous signed APK. Do not create a replacement signer for updates.')
+        if log:log('Signing preflight: saved signer found for '+candidate+'; final APK identity will still be verified.')
+    elif not candidate and not allow_new_key and log:
+        log('Signing preflight: dynamic/unknown package ID. APK will be checked for a saved signer after compilation.')
+    return candidate
+
+
+def verify_signer_against_original_apk(apk: Path, package: str, vault: SigningVault, *,
+                                        sdk: dict[str,Path] | None = None) -> str:
+    """Compare a saved local signer with a *previously signed* APK, read-only."""
+    package=validate_package_id(package)
+    apk=Path(apk)
+    if not apk.is_file() or apk.is_symlink():
+        raise BuildError('Select an existing, regular signed APK file for comparison')
+    sdk=sdk or sdk_build_tools()
+    if apk_package(apk,sdk).lower()!=package.lower():
+        raise BuildError('Old APK package does not match the selected signing identity; refusing comparison')
+    out=run([str(sdk['apksigner']),'verify','--verbose','--print-certs',str(apk)],capture=True)
+    hashes=re.findall(r'Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9]{64})',out)
+    if len(hashes)!=1:
+        raise BuildError('Old APK signer could not be uniquely verified')
+    current=vault.load(package)
+    if current is None:
+        raise BuildError('Import the original signing keystore before comparing APK signatures')
+    if hashes[0].lower()!=current.fingerprint:
+        raise BuildError('SIGNER MISMATCH: saved key does NOT match the old signed APK. Do not build an update with this key.')
+    return current.fingerprint
+
+
 def detect_project(root: Path, forced: str='auto') -> str:
     types=[]
     if (root/'pubspec.yaml').is_file() and (root/'android').is_dir():types.append('flutter')
@@ -646,7 +734,8 @@ def remote_branches(repo:str)->list[str]:
 
 
 def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
-                   project_type='auto',allow_new_key=False,log=None, sdk_root=None) -> dict:
+                   project_type='auto',allow_new_key=False,log=None, sdk_root=None,
+                   expected_package: str | None = None) -> dict:
     repo_url,repo_name=validate_repo(repo);branch=validate_branch(branch)
     sdk=sdk_build_tools(sdk_root)
     if log:log('Android SDK Build Tools found at: '+str(sdk['aapt'].parent))
@@ -655,6 +744,8 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         sha=clone_branch(repo_url,branch,src,log=log)
         kind=detect_project(src,project_type)
         if log:log(f'Project type: {kind} | source: {sha[:12]}')
+        preflight_signer(src,kind,vault,expected_package=expected_package,
+                         allow_new_key=allow_new_key,log=log)
         # Only expose per-repository secrets to this repository's build commands,
         # not to clone/git or unrelated projects. Build scripts are trusted code.
         saved=SecretVault().values(repo_url)
@@ -672,6 +763,9 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         build_source(src,kind,log=sanitized_log,env=build_env,sdk_root=selected_sdk)
         apk=choose_apk(src)
         pkg=apk_package(apk,sdk)
+        if expected_package and pkg.lower()!=expected_package.lower():
+            raise BuildError('Compiled APK package '+pkg+' differs from selected package '+
+                             expected_package+'. Do not sign the wrong app variant.')
         identity=vault.load(pkg)
         if not identity:
             if not allow_new_key:
