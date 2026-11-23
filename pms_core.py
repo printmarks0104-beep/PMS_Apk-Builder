@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -217,7 +217,7 @@ class SigningVault:
             raise BuildError('Partial or unsafe signing identity; refusing to generate another')
         cfg=json.loads(meta.read_text('utf8'))
         if cfg.get('format') != 1 or cfg.get('package') != canonical_id(package) or \
-           cfg.get('alias') != 'pmsrelease' and not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',str(cfg.get('alias'))):
+           cfg.get('alias') != 'pmsrelease' and not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',str(cfg.get('alias'))):
             raise BuildError('Invalid signing identity metadata')
         if sha256_file(key) != cfg.get('keystoreSha256'):
             raise BuildError('Keystore integrity mismatch; refusing to sign')
@@ -264,22 +264,46 @@ class SigningVault:
                  '-keypass:env','PMS_SIGNING_PASSWORD','-noprompt'],env=env)
             return self._save(package,'pmsrelease',password,target)
 
-    def import_existing(self, package: str, keystore: Path, alias: str, password: str) -> Identity:
-        """For upgrades to an already published app: original signer is mandatory."""
+    def import_existing(self, package: str, keystore: Path, alias: str,
+                        password: str, key_password: str | None = None) -> Identity:
+        """Import a user-approved ORIGINAL JKS or PKCS12, never guess passwords.
+
+        JKS key passwords may differ from store passwords. Preserve the original
+        signing certificate while converting to the local encrypted PKCS12 vault.
+        """
         validate_package_id(package)
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}',alias):
+        if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}',alias):
             raise BuildError('Invalid keystore alias')
-        if not keystore.is_file() or keystore.is_symlink():
-            raise BuildError('Existing signing keystore not found')
+        keystore=Path(keystore)
+        if not keystore.is_file() or _unsafe_reparse(keystore) or keystore.stat().st_size>20*1024*1024:
+            raise BuildError('Existing signing keystore not found or unsafe')
+        if self.location(package).exists():
+            raise BuildError('Signing identity already exists; will not overwrite existing keys')
         with tempfile.TemporaryDirectory(prefix='pms-import-') as tmp:
-            # Normalize JKS or PKCS12 to a standalone PKCS12 vault; store no plaintext passwords.
-            tmpkeystore=Path(tmp)/'import.p12'
+            target=Path(tmp)/'import.p12'
+            # JKS has a distinctive file signature; extensions are not reliable.
+            with keystore.open('rb') as input_file:
+                is_jks=input_file.read(4)==b'\xfe\xed\xfe\xed'
+            if is_jks:
+                env=os.environ.copy()
+                env['PMS_ORIGINAL_STORE_PASSWORD']=password
+                env['PMS_ORIGINAL_KEY_PASSWORD']=key_password if key_password else password
+                newpassword=secrets.token_urlsafe(42)
+                env['PMS_NEW_SIGNING_PASSWORD']=newpassword
+                run([tool('keytool'),'-importkeystore',
+                    '-srckeystore',str(keystore),'-srcstoretype','JKS',
+                    '-srcstorepass:env','PMS_ORIGINAL_STORE_PASSWORD',
+                    '-srcalias',alias,'-srckeypass:env','PMS_ORIGINAL_KEY_PASSWORD',
+                    '-destkeystore',str(target),'-deststoretype','PKCS12',
+                    '-deststorepass:env','PMS_NEW_SIGNING_PASSWORD',
+                    '-destkeypass:env','PMS_NEW_SIGNING_PASSWORD',
+                    '-destalias',alias,'-noprompt'],env=env)
+                return self._save(package,alias,newpassword,target)
             env=os.environ.copy();env['PMS_SIGNING_PASSWORD']=password
-            # PKCS12 copy; JKS users must convert to PKCS12 explicitly using keytool beforehand.
             run([tool('keytool'),'-list','-storetype','PKCS12','-keystore',str(keystore),
                  '-alias',alias,'-storepass:env','PMS_SIGNING_PASSWORD'],env=env)
-            shutil.copyfile(keystore,tmpkeystore)
-            return self._save(package,alias,password,tmpkeystore)
+            shutil.copyfile(keystore,target)
+            return self._save(package,alias,password,target)
 
     def backup(self, package: str, destination: Path, passphrase: str):
         if len(passphrase) < 12:
@@ -397,6 +421,119 @@ def sdk_build_tools(configured: str | Path | None = None, *, windows: bool | Non
                      'using Android Studio > SDK Manager. Searched: '+searched)
 
 
+# Discovery never opens the private key content, guesses passwords or imports keys.
+# The user must explicitly choose a matching original signing identity.
+KEY_SUFFIXES=frozenset(('.jks','.keystore','.p12','.pfx','.pkcs12'))
+KEY_SKIP_DIRS=frozenset(('node_modules','.git','.hg','.svn','.gradle','.venv','venv',
+  '.cache','__pycache__','build','dist','.next','temp','tmp','windows','program files',
+  'program files (x86)','sdk','gradle','android sdk','system volume information'))
+
+
+@dataclass(frozen=True)
+class KeyCandidate:
+    path: Path
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class KeySearchResult:
+    candidates: tuple[KeyCandidate, ...]
+    visited_entries: int
+    limited: bool
+
+
+def default_key_search_roots(home: Path | None = None) -> list[Path]:
+    """Find likely *current-user* key locations; never scan other user profiles."""
+    home=Path(home) if home is not None else Path.home()
+    roots=[home,home/'Documents',home/'Downloads',home/'Desktop',home/'.android',
+           home/'AppData'/'Local'/'Printmarks',home/'AppData'/'Roaming'/'Printmarks']
+    try:
+        roots.extend(p for p in home.iterdir() if p.is_dir() and p.name.lower().startswith('onedrive'))
+    except (OSError,PermissionError):pass
+    return roots
+
+
+def _unsafe_reparse(path: Path) -> bool:
+    """Avoid following shortcuts, symlinks, Windows junctions, or reparse points."""
+    try:
+        if path.is_symlink() or getattr(path,'is_junction',lambda:False)():return True
+        info=path.stat(follow_symlinks=False)
+        return bool(getattr(info,'st_file_attributes',0) & 0x400)
+    except (OSError,PermissionError):return True
+
+
+def discover_signing_keys(folders: list[Path] | None = None, *,
+                         max_depth: int = 6, max_entries: int = 50000,
+                         max_results: int = 200) -> KeySearchResult:
+    """Bounded, read-only candidate scan; no password prompts or key content reads.
+
+    Default folders cover the current Windows user and common private-app folders.
+    A separate user-chosen folder/drive can be supplied for unusual locations.
+    """
+    if max_depth<0 or max_entries<1 or max_results<1:
+        raise BuildError('Invalid signing-key search limits')
+    roots=default_key_search_roots() if folders is None else [Path(x) for x in folders]
+    seen_dirs={};seen_files=set();matches=[];count=0;limited=False
+    for initial in roots:
+        base=Path(initial).expanduser()
+        if not base.is_dir() or _unsafe_reparse(base):continue
+        # A shallow home scan avoids AppData/SDK caches; dedicated roots below
+        # search Documents, Downloads, and Printmarks more deeply.
+        depth_limit=min(max_depth,2) if folders is None and base==Path.home() else max_depth
+        stack=[(base,0)]
+        while stack:
+            directory,depth=stack.pop()
+            signature=os.path.normcase(os.path.abspath(directory))
+            remaining=depth_limit-depth
+            if seen_dirs.get(signature,-1)>=remaining:continue
+            seen_dirs[signature]=remaining
+            try:
+                with os.scandir(directory) as scan:
+                    entries=sorted(scan,key=lambda x:x.name.lower())
+            except (OSError,PermissionError):continue
+            for entry in entries:
+                count+=1
+                if count>max_entries:
+                    limited=True;break
+                p=Path(entry.path)
+                if _unsafe_reparse(p):continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth<depth_limit and entry.name.lower() not in KEY_SKIP_DIRS:
+                            stack.append((p,depth+1))
+                    elif entry.is_file(follow_symlinks=False) and p.suffix.lower() in KEY_SUFFIXES:
+                        filekey=os.path.normcase(os.path.abspath(p))
+                        if filekey in seen_files:continue
+                        seen_files.add(filekey)
+                        size=entry.stat(follow_symlinks=False).st_size
+                        if 0<size<=20*1024*1024:
+                            matches.append(KeyCandidate(p,size))
+                            if len(matches)>=max_results:
+                                limited=True;break
+                except (OSError,PermissionError):continue
+            if limited:break
+        if limited:break
+    matches.sort(key=lambda x:str(x.path).lower())
+    return KeySearchResult(tuple(matches),count,limited)
+
+
+def configure_gradle_sdk(gradle_dir: Path, sdk_root: Path) -> None:
+    """Write local.properties only inside the disposable checked-out project."""
+    gradle_dir=Path(gradle_dir)
+    sdk_root=Path(sdk_root)
+    if not gradle_dir.is_dir() or not (sdk_root/'build-tools').is_dir():
+        raise BuildError('Gradle project or Android SDK root is missing')
+    props=gradle_dir/'local.properties'
+    if props.is_symlink() or getattr(props,'is_junction',lambda:False)():
+        raise BuildError('Unsafe Gradle local.properties link')
+    try:
+        old=props.read_text('utf8') if props.exists() else ''
+    except UnicodeError as e:
+        raise BuildError('Cannot decode Gradle local.properties') from e
+    lines=[line for line in old.splitlines() if not re.match(r'^\s*sdk\.dir\s*[:=]',line)]
+    lines.append('sdk.dir='+sdk_root.as_posix())
+    props.write_text('\n'.join(lines)+'\n',encoding='utf8')
+
 def apk_package(apk: Path, sdk: dict[str,Path]) -> str:
     out=run([str(sdk['aapt']),'dump','badging',str(apk)],capture=True)
     m=re.search(r"^package:\s+name='([^']+)'",out,re.M)
@@ -434,7 +571,7 @@ def choose_apk(root:Path) ->Path:
     return next(iter(uniq))
 
 
-def build_source(root:Path, project_type:str, log=None, env=None):
+def build_source(root:Path, project_type:str, log=None, env=None, sdk_root=None):
     if project_type=='flutter':
         run([tool('flutter'),'pub','get'],cwd=root,log=log,env=env)
         run([tool('flutter'),'build','apk','--release'],cwd=root,log=log,env=env)
@@ -450,11 +587,12 @@ def build_source(root:Path, project_type:str, log=None, env=None):
         if not (root/'android').is_dir():
             run([npx,'--no-install','cap','add','android'],cwd=root,log=log,env=env)
         run([npx,'--no-install','cap','sync','android'],cwd=root,log=log,env=env)
-        return build_source(root,'gradle-android',log=log,env=env)
+        return build_source(root,'gradle-android',log=log,env=env,sdk_root=sdk_root)
     elif project_type in ('gradle','gradle-android'):
         gradle_dir=root/'android' if project_type=='gradle-android' else root
         wrapper=gradle_dir/('gradlew.bat' if os.name=='nt' else 'gradlew')
         if not wrapper.is_file():raise BuildError('Gradle wrapper missing')
+        if sdk_root is not None:configure_gradle_sdk(gradle_dir,Path(sdk_root))
         if os.name!='nt':wrapper.chmod(wrapper.stat().st_mode|0o111)
         run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log,env=env)
     else:
@@ -521,12 +659,17 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         # not to clone/git or unrelated projects. Build scripts are trusted code.
         saved=SecretVault().values(repo_url)
         build_env=os.environ.copy();build_env.update(saved)
+        # The detected build-tools directory alone is insufficient for Gradle:
+        # explicitly advertise the SDK root to the entire build chain.
+        selected_sdk=sdk['aapt'].parent.parent.parent
+        build_env['ANDROID_HOME']=str(selected_sdk)
+        build_env['ANDROID_SDK_ROOT']=str(selected_sdk)
         def sanitized_log(message):
             line=str(message)
             for value in saved.values():
                 if value:line=line.replace(value,'[REDACTED]')
             if log:log(line)
-        build_source(src,kind,log=sanitized_log,env=build_env)
+        build_source(src,kind,log=sanitized_log,env=build_env,sdk_root=selected_sdk)
         apk=choose_apk(src)
         pkg=apk_package(apk,sdk)
         identity=vault.load(pkg)

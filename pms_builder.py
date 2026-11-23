@@ -15,7 +15,8 @@ from tkinter import filedialog, messagebox, ttk
 from pms_core import (
     VERSION, BuildError, SigningVault, create_release, detect_project,
     remote_branches, sdk_build_tools, tool, validate_repo, validate_branch, parse_repo_selection,
-    publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root
+    publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root,
+    discover_signing_keys
 )
 
 
@@ -58,6 +59,8 @@ def command_line() -> int:
         choices=('auto','flutter','capacitor','gradle','gradle-android'))
     a.add_argument('--authorize-new-signing-key',action='store_true',
        help='first-time signer ONLY; do not use for an already released app')
+    a=sub.add_parser('find-keys',help='read-only search for existing signing keystores')
+    a.add_argument('--folder',help='optional custom folder or drive to scan')
     a=sub.add_parser('keys',help='show package names with existing saved identities')
     a=sub.add_parser('secrets',help='list stored project environment-secret NAMES (never values)')
     a.add_argument('--repo',required=True)
@@ -122,6 +125,14 @@ def command_line() -> int:
                  project_type=args.type,allow_new_key=args.authorize_new_signing_key,log=print,
                  sdk_root=args.sdk or load_sdk_preference())
             print('Build success:',info['apk'])
+        elif args.action=='find-keys':
+            scan=discover_signing_keys([Path(args.folder)] if args.folder else None)
+            print(f'Found {len(scan.candidates)} candidate signing key files '
+                  f'({scan.visited_entries} entries inspected).')
+            for item in scan.candidates:
+                print(str(item.path),f'({item.size_bytes} bytes)')
+            if scan.limited:print('Search limit reached; choose a smaller --folder to continue.')
+            print('Nothing was read, imported, signed or uploaded. Confirm alias and password before importing.')
         elif args.action=='backup':
             p1=getpass.getpass('Backup passphrase (12+ characters): ')
             p2=getpass.getpass('Repeat passphrase: ')
@@ -133,8 +144,10 @@ def command_line() -> int:
             restored=vault.restore(Path(args.file),key)
             print('Restored signer for',restored.package,'fingerprint',restored.fingerprint)
         elif args.action=='import-key':
-            pw=getpass.getpass('Original PKCS12 signing password: ')
-            loaded=vault.import_existing(args.package,Path(args.keystore),args.alias,pw)
+            pw=getpass.getpass('Original signing keystore password: ')
+            is_jks=Path(args.keystore).is_file() and Path(args.keystore).open('rb').read(4)==b'\xfe\xed\xfe\xed'
+            kp=getpass.getpass('JKS private-key password (Enter = same as store): ') if is_jks else None
+            loaded=vault.import_existing(args.package,Path(args.keystore),args.alias,pw,key_password=kp)
             print('Imported signing key for',loaded.package,'fingerprint',loaded.fingerprint)
         elif args.action=='github-secrets':
             if not args.confirm_upload:raise BuildError('Use --confirm-upload for explicit GitHub Actions secrets upload')
@@ -155,8 +168,8 @@ class PMSApp:
     def __init__(self,root:tk.Tk):
         self.root=root
         root.title('PMS APK Builder — portable v'+VERSION)
-        root.geometry('845x730')
-        root.minsize(750,610)
+        root.geometry('930x740')
+        root.minsize(800,610)
         self.repo=tk.StringVar()
         self.branch=tk.StringVar(value='main')
         self.output=tk.StringVar(value=default_output())
@@ -204,8 +217,9 @@ class PMSApp:
         buttons=ttk.Frame(frame);buttons.pack(fill='x',pady=12)
         self.buildbutton=ttk.Button(buttons,text='BUILD AND VERIFY APK',command=self.build)
         self.buildbutton.pack(side='left',padx=(0,10))
-        for label,fn in [('Audit tools',self.audit),('Import key',self.import_key),
-                         ('Backup key',self.backup),('Restore key',self.restore)]:
+        for label,fn in [('Audit tools',self.audit),('Find signing keys',self.find_signing_keys),
+                         ('Import key',self.import_key),('Backup key',self.backup),
+                         ('Restore key',self.restore)]:
             ttk.Button(buttons,text=label,command=fn).pack(side='left',padx=3)
         secrets_buttons=ttk.Frame(frame);secrets_buttons.pack(fill='x',pady=(0,10))
         for label,fn in [('Save build secret',self.save_build_secret),
@@ -324,16 +338,86 @@ class PMSApp:
             self.log('SUCCESS: '+r['apk'])
         self.worker(task,completion='apk')
 
-    def import_key(self):
+    def find_signing_keys(self):
+        # Default: common current-user folders; custom folder scan is optional.
+        # Do not open key bytes, try passwords or send filenames anywhere.
+        options=messagebox.askyesnocancel('Find original signing keys',
+            'Search common folders in this Windows account for .jks, .keystore, .p12, .pfx and .pkcs12 files?\n\n'
+            'YES: Standard user folders.\nNO: Choose a different folder or drive.\nCANCEL: Stop.\n\n'
+            'This searches filenames locally; it does NOT import or upload any keys.')
+        if options is None:return
+        if options:folders=None
+        else:
+            folder=filedialog.askdirectory(title='Select a folder or drive to search for signing keys',
+                                            initialdir=str(Path.home()))
+            if not folder:return
+            folders=[Path(folder)]
+        def task():
+            result=discover_signing_keys(folders)
+            self.log(f'Signing key search: {len(result.candidates)} candidate files found (local only).')
+            if result.limited:self.log('Search limit reached; choose a smaller folder to continue.')
+            self.root.after(0,lambda:self.show_found_signing_keys(result))
+        self.worker(task)
+
+    def show_found_signing_keys(self, result):
+        dialog=tk.Toplevel(self.root)
+        dialog.title('Existing signing key candidates — read only')
+        dialog.geometry('940x440')
+        dialog.transient(self.root)
+        heading='Select the ORIGINAL key for your Android package. No key is imported until you approve it.'
+        ttk.Label(dialog,text=heading).pack(anchor='w',padx=12,pady=10)
+        area=ttk.Frame(dialog);area.pack(fill='both',expand=True,padx=12,pady=6)
+        keys=ttk.Treeview(area,columns=('file','folder','size'),show='headings',selectmode='browse')
+        for name,title,width in [('file','Key file',200),('folder','Local folder',570),('size','Bytes',90)]:
+            keys.heading(name,text=title);keys.column(name,width=width,stretch=name=='folder')
+        bar=ttk.Scrollbar(area,orient='vertical',command=keys.yview)
+        keys.configure(yscrollcommand=bar.set)
+        keys.pack(side='left',fill='both',expand=True);bar.pack(side='right',fill='y')
+        found={}
+        for n,candidate in enumerate(result.candidates):
+            ident=f'key{n}'
+            found[ident]=candidate.path
+            keys.insert('', 'end',iid=ident,values=(candidate.path.name,str(candidate.path.parent),str(candidate.size_bytes)))
+        label='Found '+str(len(found))+' candidate files. Only checked locations were searched.'
+        if result.limited:label+=' Search limit reached; choose a narrower folder.'
+        ttk.Label(dialog,text=label).pack(anchor='w',padx=12,pady=4)
+        controls=ttk.Frame(dialog);controls.pack(fill='x',padx=12,pady=(4,12))
+        def use_selected():
+            selected=keys.selection()
+            if not selected:
+                messagebox.showwarning('Select a key','Choose a keystore file first.',parent=dialog);return
+            candidate=found[selected[0]]
+            if not messagebox.askyesno('Confirm ORIGINAL key',
+                'Import this key for the package ID you entered?\n\n'
+                'Do not replace a released application signer. The certificate will be verified after import.',parent=dialog):return
+            dialog.destroy()
+            self.import_key(candidate)
+        ttk.Button(controls,text='Use selected signing key',command=use_selected).pack(side='left')
+        ttk.Button(controls,text='Close',command=dialog.destroy).pack(side='right')
+
+    def import_key(self, selected_path=None):
         package=self.require_package()
         if not package:return
-        file=filedialog.askopenfilename(title='Select ORIGINAL PKCS12 release key',filetypes=[('PKCS12','*.p12 *.pfx'),('All files','*.*')])
+        file=str(selected_path) if selected_path is not None else filedialog.askopenfilename(
+            title='Select ORIGINAL Android signing keystore',
+            filetypes=[('Android signing keys','*.jks *.keystore *.p12 *.pfx *.pkcs12'),('All files','*.*')])
         if not file:return
-        alias=tk.simpledialog.askstring('Alias','Original keystore alias:',parent=self.root)
+        alias=tk.simpledialog.askstring('Alias','Original signing-key alias:',parent=self.root)
         if not alias:return
-        password=tk.simpledialog.askstring('Key password','Original signing key password:',show='*',parent=self.root)
+        password=tk.simpledialog.askstring('Key password','Original keystore password:',show='*',parent=self.root)
         if password is None:return
-        self.worker(lambda:self.log('Imported signer: '+SigningVault().import_existing(package,Path(file),alias,password).fingerprint))
+        try:
+            with Path(file).open('rb') as fp:is_jks=fp.read(4)==b'\xfe\xed\xfe\xed'
+        except OSError:
+            messagebox.showwarning('Signing key','Cannot read selected keystore file.');return
+        key_password=None
+        if is_jks:
+            key_password=tk.simpledialog.askstring('JKS key password',
+                'Private-key password (leave blank if the SAME as keystore password):',
+                show='*',parent=self.root)
+            if key_password is None:return
+        self.worker(lambda:self.log('Imported original signer: '+SigningVault().import_existing(
+            package,Path(file),alias,password,key_password=key_password).fingerprint))
 
     def backup(self):
         package=self.require_package()

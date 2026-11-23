@@ -207,3 +207,158 @@ class PortableSdkRegressionTests(unittest.TestCase):
             self.assertFalse(original.exists())
 
 if __name__=='__main__':unittest.main()
+
+
+class SigningKeyDiscoveryTests(unittest.TestCase):
+    def test_discovery_scans_user_folders_and_skips_non_keys_and_hidden_repos(self):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td)
+            download=home/'Downloads'/'my-android'/'android'/'app'
+            download.mkdir(parents=True)
+            legacy=download/'release-upload.jks';legacy.write_bytes(b'FAKE JKS TEST PLACEHOLDER')
+            (download/'notes.txt').write_text('not a key')
+            git=download/'.git';git.mkdir()
+            (git/'private.p12').write_bytes(b'not a key')
+            printmarks=home/'AppData'/'Local'/'Printmarks'/'SINGOKEY'/'Developer-Private'
+            printmarks.mkdir(parents=True)
+            other=printmarks/'owner-release.P12';other.write_bytes(b'NOT A REAL KEY')
+            with patch.object(core.Path,'home',return_value=home):
+                result=core.discover_signing_keys()
+            self.assertEqual({i.path for i in result.candidates},{legacy,other})
+            self.assertFalse(result.limited)
+            self.assertTrue(all(i.size_bytes>0 for i in result.candidates))
+
+    def test_custom_folder_and_optional_limited_search(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            (root/'one.keystore').write_bytes(b'not a secret')
+            (root/'two.pfx').write_bytes(b'not a secret')
+            results=core.discover_signing_keys([root],max_results=1)
+            self.assertEqual(len(results.candidates),1)
+            self.assertTrue(results.limited)
+            results2=core.discover_signing_keys([root],max_entries=1)
+            self.assertTrue(results2.limited)
+            self.assertLessEqual(len(results2.candidates),1)
+
+    def test_unsafe_symlink_is_not_followed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            source=root/'source';source.mkdir()
+            remote=root/'remote';remote.mkdir()
+            (remote/'original.jks').write_bytes(b'test only')
+            try:(source/'shortlink').symlink_to(remote,target_is_directory=True)
+            except (OSError,NotImplementedError):self.skipTest('Symlink unavailable')
+            found=core.discover_signing_keys([source])
+            self.assertEqual(found.candidates,())
+
+    def test_search_does_not_read_private_key_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            key=Path(td)/'secret.jks';key.write_bytes(b'only a pathname should be scanned')
+            with patch.object(Path,'read_bytes',side_effect=AssertionError('key content read')):
+                self.assertEqual(len(core.discover_signing_keys([Path(td)]).candidates),1)
+
+
+class GradleSdkEnvironmentTests(unittest.TestCase):
+    def test_local_properties_preserves_other_values_and_replaces_stale_sdk(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            android=root/'source'/'android';android.mkdir(parents=True)
+            sdk=root/'Android'/'Sdk';(sdk/'build-tools').mkdir(parents=True)
+            props=android/'local.properties'
+            props.write_text('ndk.dir=/other/ndk\nsdk.dir=C:/old/sdk\ncustom=value\n','utf8')
+            core.configure_gradle_sdk(android,sdk)
+            result=props.read_text('utf8')
+            self.assertIn('sdk.dir='+sdk.as_posix(),result)
+            self.assertEqual(result.count('sdk.dir='),1)
+            self.assertIn('ndk.dir=/other/ndk',result)
+            self.assertIn('custom=value',result)
+
+    def test_gradle_builder_receives_local_properties(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            android=root/'android';android.mkdir()
+            sdk=root/'sdk';(sdk/'build-tools').mkdir(parents=True)
+            (android/'gradlew.bat').write_text('@echo off\n')
+            (android/'gradlew').write_text('#!/bin/sh\n')
+            with patch.object(core,'run') as subprocess_stub:
+                core.build_source(root,'gradle-android',env={'ANDROID_HOME':str(sdk)},sdk_root=sdk)
+            self.assertIn('sdk.dir='+sdk.as_posix(),(android/'local.properties').read_text('utf8'))
+            self.assertEqual(subprocess_stub.call_count,1)
+            self.assertEqual(subprocess_stub.call_args.kwargs['env']['ANDROID_HOME'],str(sdk))
+
+    def test_gradle_rejects_linked_local_properties(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            android=root/'android';android.mkdir()
+            sdk=root/'sdk';(sdk/'build-tools').mkdir(parents=True)
+            outside=root/'original.properties';outside.write_text('do not modify')
+            try:(android/'local.properties').symlink_to(outside)
+            except (OSError,NotImplementedError):self.skipTest('Symlink unavailable')
+            with self.assertRaisesRegex(core.BuildError,'Unsafe'):
+                core.configure_gradle_sdk(android,sdk)
+            self.assertEqual(outside.read_text(),'do not modify')
+
+
+@unittest.skipUnless(shutil.which('keytool'), 'JDK keytool required')
+class OriginalJksSigningImportTests(unittest.TestCase):
+    def test_import_original_jks_with_distinct_store_and_key_password(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            source=root/'existing-owner.jks'
+            env=os.environ.copy()
+            env['PMS_SRC_STORE']='test-store-password-123'
+            env['PMS_SRC_KEY']='test-key-password-456'
+            subprocess.run([shutil.which('keytool'),'-genkeypair','-keyalg','RSA',
+                '-keysize','2048','-storetype','JKS','-keystore',str(source),
+                '-alias','original.owner','-dname','CN=Signing Test',
+                '-validity','365', '-storepass:env','PMS_SRC_STORE',
+                '-keypass:env','PMS_SRC_KEY','-noprompt'],env=env,check=True,
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+            vault=core.SigningVault(root/'vault')
+            with patch.object(core,'dpapi_encrypt',side_effect=lambda b:b[::-1]), \
+                 patch.object(core,'dpapi_decrypt',side_effect=lambda b:b[::-1]):
+                imported=vault.import_existing('com.example.released',source,
+                  'original.owner','test-store-password-123',key_password='test-key-password-456')
+                self.assertNotEqual(imported.password,'test-store-password-123')
+                self.assertTrue(imported.keystore.exists())
+                self.assertEqual(vault.load('com.example.released').fingerprint,imported.fingerprint)
+                with self.assertRaises(core.BuildError):
+                    vault.import_existing('com.example.released',source,
+                      'original.owner','test-store-password-123','test-key-password-456')
+
+
+class ReleaseSdkHandoffTests(unittest.TestCase):
+    def test_detected_sdk_root_is_passed_to_gradle_subprocess(self):
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            sdk=root/'Sdk'; buildtools=sdk/'build-tools'/'36.0.0';buildtools.mkdir(parents=True)
+            aapt=buildtools/'aapt.exe';aapt.write_bytes(b'aapt')
+            aligned={name:buildtools/name for name in ('aapt.exe','zipalign.exe','apksigner.bat')}
+            env_seen=[]
+            def fake_build(src,kind,log=None,env=None,sdk_root=None):
+                self.assertEqual(str(sdk),str(sdk_root))
+                self.assertEqual(env['ANDROID_HOME'],str(sdk))
+                self.assertEqual(env['ANDROID_SDK_ROOT'],str(sdk))
+                env_seen.append(True)
+            def fake_clone(repo,branch,src,log=None):
+                src.mkdir(parents=True)
+                return 'a'*40
+            mocked_vault=MagicMock()
+            mocked_vault.load.return_value=core.Identity('com.example.app','release', 'c'*64,root/'release.p12','test')
+            def fake_signed(source_apk,package,identity,dest,sdk,log=None):
+                dest.parent.mkdir(parents=True,exist_ok=True)
+                dest.write_bytes(b'unit test only')
+                return 'a'*64
+            with patch.object(core,'sdk_build_tools',return_value={
+                    'aapt':aligned['aapt.exe'],'zipalign':aligned['zipalign.exe'],'apksigner':aligned['apksigner.bat']}),\
+                 patch.object(core,'clone_branch',side_effect=fake_clone),\
+                 patch.object(core,'detect_project',return_value='gradle-android'),\
+                 patch.object(core,'build_source',side_effect=fake_build),\
+                 patch.object(core,'choose_apk',return_value=root/'fake.apk'),\
+                 patch.object(core,'apk_package',return_value='com.example.app'),\
+                 patch.object(core,'signed_apk',side_effect=fake_signed),\
+                 patch.object(core.SecretVault,'values',return_value={}):
+                result=core.create_release('https://github.com/owner/project','main',root/'output',mocked_vault)
+            self.assertEqual(len(env_seen),1)
+            self.assertEqual(result['projectType'],'gradle-android')

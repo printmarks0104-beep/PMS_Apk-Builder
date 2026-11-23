@@ -21,7 +21,7 @@ The builder signs the **final APK** using the same saved PKCS12 identity for tha
 
 ## Fix for “Android SDK Build Tools missing” on Windows
 
-**v0.1.1 corrects a Windows-specific detection bug.** Official Windows Android SDK Build Tools commonly contain `aapt.exe`, `zipalign.exe`, **`apksigner.bat`**, not `apksigner.exe`. Previous versions incorrectly looked only for `.exe` and could report missing SDK tools on a configured Windows PC.
+**v0.1.1 and later correct a Windows-specific detection bug.** Official Windows Android SDK Build Tools commonly contain `aapt.exe`, `zipalign.exe`, **`apksigner.bat`**, not `apksigner.exe`. Previous versions incorrectly looked only for `.exe` and could report missing SDK tools on a configured Windows PC.
 
 - Click **Audit tools** to see discovery results. PMS checks `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `%LOCALAPPDATA%\Android\Sdk`, and other normal SDK locations, using one complete Build Tools version rather than mixing binaries from different versions.
 - Click **Find / Select SDK**, and select a directory such as `C:\Users\Administrator\AppData\Local\Android\Sdk` **not** its `build-tools\35.0.0` child. This persists only your SDK root path, not any key.
@@ -32,10 +32,24 @@ The builder signs the **final APK** using the same saved PKCS12 identity for tha
 
 Documentation: [Android SDK Manager](https://developer.android.com/tools/sdkmanager) and [Build apps from the command line](https://developer.android.com/build/building-cmdline).
 
+## Fix for Gradle "SDK location not found" (v0.1.2)
+
+After detecting the Android SDK, PMS now forwards its root as both `ANDROID_HOME` and `ANDROID_SDK_ROOT` to npm/Capacitor/Flutter/Gradle build processes. For Gradle, it also writes `sdk.dir=...` in **`local.properties` inside the temporary clone only**, preserving other local properties. This fixes the case where Build Tools were detected but Gradle could not discover the SDK. Your original repository and source checkout are never changed. Other project-specific build dependencies, SDK licenses or signing errors can still stop a build.
+
+## Find an existing signing key on this PC (v0.1.2)
+
+- Click **Find signing keys**. Choose **YES** to scan typical directories for your current Windows account (`Documents`, `Downloads`, `Desktop`, `.android`, Printmarks app-private folders and OneDrive), or **NO** to select another folder or drive. The scan is read-only, bounded, and does not traverse junctions/symlinks, system folders, Git directories or build caches.
+- Results show only candidate files ending in `.jks`, `.keystore`, `.p12`, `.pfx` or `.pkcs12`, with their locations and sizes. **A filename match is not proof the certificate belongs to your app.** You must select the ORIGINAL keystore for the application being updated.
+- Enter the Android package ID, select the key, and supply its alias and password. A JKS may have a different private-key password; PMS prompts separately. Only on **explicit approval** will PMS read/convert/import that key into the local encrypted signing vault. The original file remains unchanged. The imported certificate is verified; saved identities cannot be overwritten or replaced by another signer automatically.
+- Existing released APKs must be updated with their **original** certificate. Do not use **Allow NEW signing key** for an installed app. The local saved vault is protected by Windows DPAPI and should be transferred with a separately encrypted `.pmskey` backup.
+- Search does **not** crawl every Windows user account or every connected drive by default; select a custom folder/drive when required. It never searches for or reveals signing passwords and never uploads candidate files to GitHub.
+
+CLI equivalent: `python pms_builder.py find-keys` or `python pms_builder.py find-keys --folder "D:\MyBackups"`.
+
 ## Signing keys: important
 
 - On an application's **first ever release only**, choose `Allow NEW signing key` and explicitly approve the warning. This generates an RSA-3072 PKCS12 signing identity with `keytool`. It is stored under `%LOCALAPPDATA%\PMS-Apk-Builder\signing\<application-id>\`.
-- For **existing published apps**, turn OFF new-key creation and import the **original PKCS12 key** and alias first. A new signing identity **cannot update an already-installed app signed with a different key**. JKS users should convert their existing keystore to PKCS12 with keytool and preserve the original keystore/certificate.
+- For **existing published apps**, turn OFF new-key creation and import the **original JKS or PKCS12 key** and alias first. A new signing identity **cannot update an already-installed app signed with a different key**. PMS can convert a user-selected JKS to its protected PKCS12 vault after verifying the password; the original JKS file is never overwritten.
 - The keystore password is randomly generated and encrypted using **Windows DPAPI** for the current Windows user. No plaintext key/password is stored in GitHub, this EXE folder, source checkout, or build logs.
 - For another PC, use `Backup key` with a strong passphrase and store the `.pmskey` file **offline** in a secure backup location. It encrypts both the key and password using AES-256-GCM and scrypt. Use `Restore key` on the new PC. **Store the passphrase separately**; there is no recovery if both passphrase and key are lost.
 - The vault intentionally refuses to overwrite any existing identity. One package ID maps to one pinned certificate. An app may use different certificates for independent release variants only if they have separate package IDs.
@@ -51,7 +65,7 @@ Use **Backup build secrets** to create a separately encrypted `.pmsenv` file for
 
 1. Launch `PMS-Apk-Builder.exe`. Enter your `https://github.com/owner/repo` **or** a GitHub browser link ending in `/tree/your/branch`; then **Get branches** and select the intended branch. The picker recognizes links with a branch name.
 2. Use **Audit tools** to see missing dependencies. If the SDK is installed at a nonstandard location, click **Find / Select SDK** and choose the **SDK root** directory (the folder that contains `build-tools`). This non-secret folder preference is saved for the current Windows user. Set output folder and leave project type as **auto** unless needed.
-3. If updating an existing app, **Import key** first; otherwise authorize automatic creation for a truly new app.
+3. If updating an existing app, click **Find signing keys**, inspect the candidates, and **Import key** with its alias/password first; otherwise authorize automatic creation for a truly new app.
 4. **BUILD AND VERIFY APK**. An APK is declared successful only if build, signing, certificate and package validation all pass.
 5. Immediately export an **encrypted signing backup**, store it off-PC, and confirm you can restore it on a separate test PC before publishing your app.
 
