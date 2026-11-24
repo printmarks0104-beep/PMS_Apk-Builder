@@ -234,6 +234,7 @@ class PMSApp:
         self.new_key=tk.BooleanVar(value=False)
         self.auto_keys=tk.BooleanVar(value=True)
         self.last_key_context=None
+        self.last_key_selection=None
         self.package=tk.StringVar()
         self.console=queue.Queue()
         self.busy=False
@@ -456,6 +457,7 @@ class PMSApp:
                     self.log('Key scan finished for a previous branch. Re-run Auto-match signer.')
                     return
                 self.last_key_context=result
+                self.last_key_selection=(repo,branch,profile,recipe)
                 if result.package:
                     self.package.set(result.package)
                     self.log('Signer target: '+result.package+
@@ -578,11 +580,17 @@ class PMSApp:
         # Even the manual Import button should honor the selected branch's
         # pinned certificate once the automatic preflight has loaded it.
         context=self.last_key_context
-        if (not expected_sha256 and context and context.expected_certificate and
-                context.package and context.package.lower()==package.lower() and
-                context.repository==self.repo.get().strip() and
-                context.branch==self.branch.get().strip()):
+        selection=(self.repo.get().strip(),self.branch.get().strip(),
+                   self.recipe_profile.get().strip() or 'auto',self.recipe_file.get().strip())
+        valid_context=(context and self.last_key_selection==selection and
+                       context.package and context.package.lower()==package.lower())
+        if not expected_sha256 and valid_context and context.expected_certificate:
             expected_sha256=context.expected_certificate
+        if not expected_sha256 and self.recipe_file.get().strip():
+            messagebox.showwarning('Verify signer before import',
+                'Run Auto-match signer for the currently selected branch and recipe first. '
+                'A previously selected profile may require a different certificate.')
+            return
         file=str(selected_path) if selected_path is not None else filedialog.askopenfilename(
             title='Select ORIGINAL Android signing keystore',
             filetypes=[('Android signing keys','*.jks *.keystore *.p12 *.pfx *.pkcs12'),('All files','*.*')])
