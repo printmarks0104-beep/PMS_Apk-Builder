@@ -199,6 +199,7 @@ class NativeReleaseV15Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);android=root/'android';android.mkdir()
             (android/'gradlew').write_text('# test wrapper')
+            (android/'gradlew.bat').write_text('@echo off')
             signed={'CM_KEY_ALIAS':'pmsrelease','CM_KEYSTORE_PASSWORD':'local-test-only'}
             generic={'CM_KEY_ALIAS':'wrong'}
             called=[]
