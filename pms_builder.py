@@ -19,6 +19,8 @@ from pms_core import (
     publish_github_secrets, publish_project_github_secrets, SecretVault, vault_root,
     discover_signing_keys
 )
+from pms_keymatch import inspect_selected_branch
+
 
 
 def default_output() -> str:
@@ -27,6 +29,26 @@ def default_output() -> str:
 
 def sdk_preference_file() -> Path:
     return vault_root()/'settings.json'
+
+
+def load_key_search_folders() -> list[Path]:
+    try:
+        cfg=json.loads(sdk_preference_file().read_text('utf8'))
+        raw=cfg.get('keySearchFolders',[]) if cfg.get('format')==1 else []
+        return [Path(p) for p in raw if isinstance(p,str) and p][:12]
+    except (OSError, ValueError, TypeError):return []
+
+
+def save_key_search_folders(folders: list[Path]):
+    path=sdk_preference_file()
+    try:cfg=json.loads(path.read_text('utf8'))
+    except (OSError,ValueError):cfg={}
+    cfg['format']=1
+    cfg['keySearchFolders']=[str(p) for p in folders[:12]]
+    path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(cfg,indent=2),encoding='utf8')
+    tmp.replace(path)
 
 
 def load_sdk_preference() -> str:
@@ -43,7 +65,11 @@ def save_sdk_preference(directory: str) -> None:
     filename=sdk_preference_file()
     filename.parent.mkdir(parents=True,exist_ok=True)
     temporary=filename.with_suffix('.tmp')
-    temporary.write_text(json.dumps({'format':1,'sdkRoot':directory}),encoding='utf8')
+    try:cfg=json.loads(filename.read_text('utf8'))
+    except (OSError,ValueError):cfg={}
+    cfg['format']=1
+    cfg['sdkRoot']=directory
+    temporary.write_text(json.dumps(cfg,indent=2),encoding='utf8')
     temporary.replace(filename)
 
 
@@ -65,6 +91,10 @@ def command_line() -> int:
        help='first-time signer ONLY; do not use for an already released app')
     a=sub.add_parser('verify-old-apk',help='compare imported signer with a previously signed APK')
     a.add_argument('--package',required=True);a.add_argument('--apk',required=True)
+    a=sub.add_parser('match-keys',help='auto-search for keystores matching a selected repo, branch, profile')
+    a.add_argument('--repo',required=True);a.add_argument('--branch',required=True)
+    a.add_argument('--recipe-profile',default='auto');a.add_argument('--recipe-file')
+    a.add_argument('--package');a.add_argument('--folder',action='append')
     a=sub.add_parser('find-keys',help='read-only search for existing signing keystores')
     a.add_argument('--folder',help='optional custom folder or drive to scan')
     a=sub.add_parser('keys',help='show package names with existing saved identities')
@@ -98,6 +128,19 @@ def command_line() -> int:
             except BuildError as e:print(e)
             print('Signing vault:',vault.root)
             print('Stored signing identities:',', '.join(vault.list_packages()) or '(none)')
+        elif args.action=='match-keys':
+            folders=[*load_key_search_folders(),*([Path(f) for f in args.folder] if args.folder else [])]
+            roots=None if not folders else [*__import__('pms_core').default_key_search_roots(),*folders]
+            result=inspect_selected_branch(args.repo,args.branch,recipe_profile=args.recipe_profile,
+                       recipe_file=Path(args.recipe_file) if args.recipe_file else None,
+                       expected_package=args.package,vault=vault,folders=roots)
+            print('Package:',result.package or '(not statically determinable)')
+            print('Expected certificate:',result.expected_certificate or '(not pinned by recipe)')
+            if result.saved_signer_matches:print('COMPATIBLE: verified signer already saved in encrypted vault')
+            for item in result.matches:print('PUBLIC CERT MATCH (password confirmation required):',item.path,'alias:',item.alias)
+            print('Other candidate files (unverified):',len(result.other_candidates))
+            for item in result.other_candidates:print('UNVERIFIED:',item.path)
+            if result.scan_limited:print('WARNING: search limit reached')
         elif args.action=='branches':
             validate_repo(args.repo)
             for item in remote_branches(args.repo):print(item)
@@ -189,6 +232,8 @@ class PMSApp:
         self.recipe_profile=tk.StringVar(value='auto')
         self.recipe_file=tk.StringVar()
         self.new_key=tk.BooleanVar(value=False)
+        self.auto_keys=tk.BooleanVar(value=True)
+        self.last_key_context=None
         self.package=tk.StringVar()
         self.console=queue.Queue()
         self.busy=False
@@ -207,6 +252,7 @@ class PMSApp:
         ttk.Button(g,text='Get branches',command=self.branches).grid(row=0,column=2,**pad)
         ttk.Label(g,text='Branch').grid(row=1,column=0,sticky='w',**pad)
         self.branches_cb=ttk.Combobox(g,textvariable=self.branch)
+        self.branches_cb.bind('<<ComboboxSelected>>',lambda _event:self.queue_auto_key_match())
         self.branches_cb.grid(row=1,column=1,sticky='ew',**pad)
         ttk.Label(g,text='Build recipe profile').grid(row=2,column=0,sticky='w',**pad)
         ttk.Entry(g,textvariable=self.recipe_profile).grid(row=2,column=1,sticky='ew',**pad)
@@ -224,6 +270,8 @@ class PMSApp:
         ttk.Entry(g,textvariable=self.sdk_root).grid(row=6,column=1,sticky='ew',**pad)
         ttk.Button(g,text='Find / Select SDK',command=self.choose_sdk).grid(row=6,column=2,**pad)
         g.columnconfigure(1,weight=1)
+        ttk.Checkbutton(frame,text='Automatically search compatible signing keys when a branch is selected',
+                        variable=self.auto_keys).pack(anchor='w',padx=12,pady=(6,0))
         ttk.Checkbutton(frame,text='Allow NEW signing key automatically if none exists (FIRST RELEASE ONLY)',
                         variable=self.new_key).pack(anchor='w',padx=12,pady=(8,8))
         ttk.Label(frame,text='If a repository has custom native code, select its trusted recipe file before building.',
@@ -233,10 +281,13 @@ class PMSApp:
         buttons=ttk.Frame(frame);buttons.pack(fill='x',pady=12)
         self.buildbutton=ttk.Button(buttons,text='BUILD AND VERIFY APK',command=self.build)
         self.buildbutton.pack(side='left',padx=(0,10))
-        for label,fn in [('Audit tools',self.audit),('Find signing keys',self.find_signing_keys),
+        for label,fn in [('Audit tools',self.audit),('Auto-match signer',self.auto_match_signer)]:
+            ttk.Button(buttons,text=label,command=fn).pack(side='left',padx=3)
+        key_buttons=ttk.Frame(frame);key_buttons.pack(fill='x',pady=(0,8))
+        for label,fn in [('Add key folder',self.add_key_folder),('Find signing keys',self.find_signing_keys),
                          ('Import key',self.import_key),('Backup key',self.backup),
                          ('Restore key',self.restore)]:
-            ttk.Button(buttons,text=label,command=fn).pack(side='left',padx=3)
+            ttk.Button(key_buttons,text=label,command=fn).pack(side='left',padx=3)
         secrets_buttons=ttk.Frame(frame);secrets_buttons.pack(fill='x',pady=(0,10))
         ttk.Button(secrets_buttons,text='Compare signer vs old APK',
                    command=self.verify_original_apk).pack(side='left',padx=3)
@@ -305,6 +356,7 @@ class PMSApp:
         if f:
             self.recipe_file.set(f)
             self.log('Local build recipe selected: '+str(Path(f).name))
+            self.queue_auto_key_match()
 
     def branches(self):
         repo=self.repo.get().strip()
@@ -321,6 +373,7 @@ class PMSApp:
                     self.branch.set(branch_hint)
                 elif names and self.branch.get() not in names:
                     self.branch.set('main' if 'main' in names else names[0])
+                if self.auto_keys.get():self.root.after(450,self.auto_match_signer)
             self.root.after(0,set_branches)
         self.worker(task)
 
@@ -367,6 +420,100 @@ class PMSApp:
                              recipe_file=Path(selected_recipe_file) if selected_recipe_file else None)
             self.log('SUCCESS: '+r['apk'])
         self.worker(task,completion='apk')
+
+    def queue_auto_key_match(self):
+        if self.auto_keys.get():self.root.after(120,self.auto_match_signer)
+
+    def add_key_folder(self):
+        selection=filedialog.askdirectory(title='Add a folder to automatic local signing-key searches',
+                                          initialdir=str(Path.home()))
+        if not selection:return
+        path=Path(selection)
+        folders=load_key_search_folders()
+        if path not in folders:
+            if len(folders)>=12:
+                messagebox.showwarning('Key search folders','Limit is 12 additional folders.');return
+            folders.append(path);save_key_search_folders(folders)
+        self.log('Remembered local key search folder: '+str(path))
+        self.queue_auto_key_match()
+
+    def auto_match_signer(self):
+        repo=self.repo.get().strip();branch=self.branch.get().strip()
+        if self.busy:return
+        try:validate_repo(repo);validate_branch(branch)
+        except BuildError:return
+        profile=self.recipe_profile.get().strip() or 'auto'
+        recipe=self.recipe_file.get().strip()
+        package=self.package.get().strip() or None
+        def task():
+            import pms_core
+            folders=[*pms_core.default_key_search_roots(),*load_key_search_folders()]
+            result=inspect_selected_branch(repo,branch,recipe_profile=profile,
+                 recipe_file=Path(recipe) if recipe else None,expected_package=package,
+                 vault=SigningVault(),folders=folders,log=self.log)
+            def finished():
+                if self.repo.get().strip()!=repo or self.branch.get().strip()!=branch:
+                    self.log('Key scan finished for a previous branch. Re-run Auto-match signer.')
+                    return
+                self.last_key_context=result
+                if result.package:
+                    self.package.set(result.package)
+                    self.log('Signer target: '+result.package+
+                      (' | pinned certificate '+result.expected_certificate[:16]+'...' if result.expected_certificate else ' | certificate not pinned'))
+                if result.saved_signer_matches:
+                    self.log('MATCH: compatible signer verified in encrypted local vault.')
+                else:
+                    self.log(f'Key search: {len(result.matches)} matching JKS certificates; '
+                             f'{len(result.other_candidates)} password-required/unverified candidates.')
+                    if result.scan_limited:self.log('Search limit reached; Add key folder for a focused scan.')
+                    self.show_key_match_results(result)
+            self.root.after(0,finished)
+        self.worker(task)
+
+    def show_key_match_results(self,result):
+        dialog=tk.Toplevel(self.root)
+        dialog.title('Local signer compatibility — '+result.branch)
+        dialog.geometry('970x480');dialog.transient(self.root)
+        target=result.package or 'Not determined'
+        expected=result.expected_certificate or 'Not pinned; confirm against an older signed APK'
+        ttk.Label(dialog,text='App package: '+target).pack(anchor='w',padx=12,pady=(10,3))
+        ttk.Label(dialog,text='Required certificate: '+expected).pack(anchor='w',padx=12,pady=(2,6))
+        ttk.Label(dialog,text='JKS certificate matches are provisional until password/keytool verification. '
+                                 'Other files cannot be proven compatible without credentials.',wraplength=925).pack(anchor='w',padx=12,pady=4)
+        box=ttk.Frame(dialog);box.pack(fill='both',expand=True,padx=12,pady=5)
+        tree=ttk.Treeview(box,columns=('status','alias','file','folder'),show='headings',selectmode='browse')
+        for n,title,width in [('status','Compatibility',180),('alias','Alias',125),('file','Keystore',170),('folder','Folder',380)]:
+            tree.heading(n,text=title);tree.column(n,width=width,stretch=n=='folder')
+        tree.pack(side='left',fill='both',expand=True)
+        scroller=ttk.Scrollbar(box,orient='vertical',command=tree.yview)
+        tree.configure(yscrollcommand=scroller.set)
+        scroller.pack(side='right',fill='y')
+        entries={}
+        for i,item in enumerate([*result.matches,*result.other_candidates]):
+            key='item'+str(i);entries[key]=item
+            label='Public cert matches' if item.status=='certificate-candidate' else 'Unknown - password needed'
+            tree.insert('', 'end',iid=key,values=(label,item.alias or '(unknown)',item.path.name,str(item.path.parent)))
+        if result.matches:tree.selection_set('item0')
+        bottom=ttk.Frame(dialog);bottom.pack(fill='x',padx=12,pady=10)
+        def choose():
+            selected=tree.selection()
+            if not selected:return
+            item=entries[selected[0]]
+            if not result.package:
+                messagebox.showwarning('Package ID required','Enter the package ID first.',parent=dialog);return
+            if not result.expected_certificate:
+                messagebox.showwarning('Signer unverified',
+                    'This branch has no pinned signer certificate. Compare a previous signed APK or configure a trusted recipe first. '
+                    'Automatic compatibility cannot be established.',parent=dialog);return
+            if not messagebox.askyesno('Import matching ORIGINAL signer',
+                  'PMS will verify the selected keystore against the exact pinned certificate before saving it. '
+                  'It will not overwrite any existing signing identity. Continue?',parent=dialog):return
+            dialog.destroy()
+            self.package.set(result.package)
+            self.import_key(item.path,expected_sha256=result.expected_certificate,
+                            alias_hint=item.alias,package_override=result.package)
+        ttk.Button(bottom,text='Verify & import selected key',command=choose).pack(side='left')
+        ttk.Button(bottom,text='Close',command=dialog.destroy).pack(side='right')
 
     def find_signing_keys(self):
         # Default: common current-user folders; custom folder scan is optional.
@@ -425,14 +572,23 @@ class PMSApp:
         ttk.Button(controls,text='Use selected signing key',command=use_selected).pack(side='left')
         ttk.Button(controls,text='Close',command=dialog.destroy).pack(side='right')
 
-    def import_key(self, selected_path=None):
-        package=self.require_package()
+    def import_key(self, selected_path=None, *, expected_sha256=None,alias_hint=None,package_override=None):
+        package=package_override or self.require_package()
         if not package:return
+        # Even the manual Import button should honor the selected branch's
+        # pinned certificate once the automatic preflight has loaded it.
+        context=self.last_key_context
+        if (not expected_sha256 and context and context.expected_certificate and
+                context.package and context.package.lower()==package.lower() and
+                context.repository==self.repo.get().strip() and
+                context.branch==self.branch.get().strip()):
+            expected_sha256=context.expected_certificate
         file=str(selected_path) if selected_path is not None else filedialog.askopenfilename(
             title='Select ORIGINAL Android signing keystore',
             filetypes=[('Android signing keys','*.jks *.keystore *.p12 *.pfx *.pkcs12'),('All files','*.*')])
         if not file:return
-        alias=tk.simpledialog.askstring('Alias','Original signing-key alias:',parent=self.root)
+        alias=tk.simpledialog.askstring('Alias','Original signing-key alias:',
+            initialvalue=alias_hint or '',parent=self.root)
         if not alias:return
         password=tk.simpledialog.askstring('Key password','Original keystore password:',show='*',parent=self.root)
         if password is None:return
@@ -447,7 +603,8 @@ class PMSApp:
                 show='*',parent=self.root)
             if key_password is None:return
         self.worker(lambda:self.log('Imported original signer: '+SigningVault().import_existing(
-            package,Path(file),alias,password,key_password=key_password).fingerprint))
+            package,Path(file),alias,password,key_password=key_password,
+            expected_sha256=expected_sha256).fingerprint))
 
     def verify_original_apk(self):
         package=self.require_package()

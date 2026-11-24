@@ -176,3 +176,47 @@ For **published applications**, replace `null` with the pinned **original signin
 **Security note:** The selected repository may itself run arbitrary code during npm, Gradle, Flutter, or recipe hooks. Do not supply secrets to untrusted branches. A successful EXE packaging/test run alone does not certify a project's APK on a real Android phone.
 
 For repositories that cannot or should not be changed, you can instead use a **local recipe file**: click **Select recipe file** in the EXE or pass `--recipe-file C:\path\to\trusted-recipe.json`. This applies the selected recipe to the checked-out branch without adding any file or commit to the source repository. The local path is not automatically remembered across apps, so the wrong repository's recipe cannot silently run. Never select recipes from untrusted sources. Profiles and certificate guards work identically for local and repository-owned recipes.
+
+## Automatic signing-key matching (v0.1.5)
+
+Selecting a repository/branch in the EXE triggers a **local, read-only** signing-key
+preflight by default. The **Auto-match signer** button runs it again. The app
+checks the exact selected branch's `.pms-apk.json` or selected local recipe,
+uses the recipe profile's package ID and optional `signerSha256`, and checks the
+DPAPI-protected signing vault first. Compatible saved identities are reused
+without needing to browse for a key.
+
+If a matching saved identity is unavailable, the app searches likely current-user
+folders and nested `Owner-Private`, `Developer-Private`, and other private/builder
+folders generically. Use **Add key folder** once for any other location or drive;
+only directory paths, not private keys, are saved in the settings file. Search
+limits prevent unbounded scanning. It never automatically imports, sends or
+copies keystore files during discovery.
+
+For **JKS**, the tool can inspect the *public signing certificate* without a
+password and highlight a candidate matching the pinned SHA-256. The JKS file's
+integrity cannot be authenticated until its password is supplied: a candidate
+is **not verified** until keytool unlocks/imports it, confirms its alias,
+private-key access, and exact certificate fingerprint. For encrypted PKCS12,
+no match is claimed until the correct password is supplied. A repository with
+no pinned certificate cannot be matched reliably by filename, folder or branch
+name alone: provide an approved recipe signer SHA-256 or an original signed APK
+for comparison.
+
+With approval, an original signer that matches the recipe can be stored *alongside*
+a different already saved signer for the same package, under the certificate-
+pinned `alternatives` directory in the local encrypted signing vault. The existing
+identity is never overwritten, deleted or silently reassigned. Recipe builds
+select the **exact** certificate fingerprint for that package. Customer and
+Developer signing identities remain isolated. A `.pmskey` encrypted backup
+requires its passphrase to restore; GitHub Actions Secrets cannot be retrieved.
+
+**CLI preflight** (no key material or password required):
+
+```powershell
+PMS-Apk-Builder.exe match-keys --repo https://github.com/owner/repo --branch main --recipe-profile customer --recipe-file C:\private\customer.pms-apk.json
+```
+
+This searches locally and reports candidate paths and public certificate matches;
+it does **not** prove an APK is compatible until the complete native release
+recipe, private signing-key authentication, and APK verification succeed.

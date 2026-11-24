@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pms_recipe import RecipeError, load_recipe, recipe_env, run_recipe_stage
 
-VERSION = '0.1.4'
+VERSION = '0.1.5'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -209,7 +209,18 @@ class SigningVault:
         return sorted(p.name for p in self.root.iterdir() if p.is_dir() and (p/'identity.json').exists())
 
     def load(self, package: str) -> Identity | None:
-        dirpath=self.location(package)
+        return self._load_at(self.location(package),package)
+
+    def load_for_certificate(self, package: str, expected_sha256: str) -> Identity | None:
+        """Choose an existing verified identity by cert, preserving other variants."""
+        if not re.fullmatch(r'[a-f0-9]{64}', expected_sha256):
+            raise BuildError('Invalid required signing certificate fingerprint')
+        default=self.load(package)
+        if default and default.fingerprint==expected_sha256:return default
+        return self._load_at(self.root/'alternatives'/canonical_id(package)/expected_sha256,package,
+                             required_fingerprint=expected_sha256)
+
+    def _load_at(self,dirpath: Path,package:str,required_fingerprint:str|None=None) -> Identity | None:
         meta=dirpath/'identity.json'
         key=dirpath/'release.p12'
         secret=dirpath/'password.dpapi'
@@ -224,17 +235,23 @@ class SigningVault:
             raise BuildError('Keystore integrity mismatch; refusing to sign')
         password=dpapi_decrypt(secret.read_bytes()).decode('utf8')
         fp=keytool_certificate(key,cfg['alias'],password)
-        if fp != cfg.get('fingerprint'):
+        if fp != cfg.get('fingerprint') or (required_fingerprint and fp!=required_fingerprint):
             raise BuildError('Signer fingerprint changed; refusing to sign')
         return Identity(cfg['package'],cfg['alias'],fp,key,password)
 
-    def _save(self,package: str,alias: str,password: str,src: Path) -> Identity:
+    def _save(self,package: str,alias: str,password: str,src: Path, *,
+              expected_sha256:str|None=None) -> Identity:
+        cert=keytool_certificate(src,alias,password)
+        if expected_sha256 and cert!=expected_sha256:
+            raise BuildError('Certificate mismatch: this key cannot sign the selected app profile')
         dest=self.location(package)
+        if expected_sha256 and dest.exists():
+            # Never overwrite a previously installed signer or its DPAPI secret.
+            dest=self.root/'alternatives'/canonical_id(package)/expected_sha256
         if dest.exists():
             raise BuildError('Signing identity already exists; will not overwrite existing keys')
         dest.mkdir(parents=True, mode=0o700, exist_ok=False)
         try:
-            cert=keytool_certificate(src,alias,password)
             (dest/'release.p12').write_bytes(src.read_bytes())
             (dest/'password.dpapi').write_bytes(dpapi_encrypt(password.encode('utf8')))
             meta={'format':1,'package':canonical_id(package),'alias':alias,
@@ -266,7 +283,8 @@ class SigningVault:
             return self._save(package,'pmsrelease',password,target)
 
     def import_existing(self, package: str, keystore: Path, alias: str,
-                        password: str, key_password: str | None = None) -> Identity:
+                        password: str, key_password: str | None = None, *,
+                        expected_sha256: str | None = None) -> Identity:
         """Import a user-approved ORIGINAL JKS or PKCS12, never guess passwords.
 
         JKS key passwords may differ from store passwords. Preserve the original
@@ -278,7 +296,12 @@ class SigningVault:
         keystore=Path(keystore)
         if not keystore.is_file() or _unsafe_reparse(keystore) or keystore.stat().st_size>20*1024*1024:
             raise BuildError('Existing signing keystore not found or unsafe')
-        if self.location(package).exists():
+        if expected_sha256 and not re.fullmatch(r'[a-f0-9]{64}', expected_sha256):
+            raise BuildError('Invalid required signing certificate fingerprint')
+        if expected_sha256:
+            if self.load_for_certificate(package,expected_sha256):
+                raise BuildError('This verified signer is already saved for the selected app')
+        elif self.location(package).exists():
             raise BuildError('Signing identity already exists; will not overwrite existing keys')
         with tempfile.TemporaryDirectory(prefix='pms-import-') as tmp:
             target=Path(tmp)/'import.p12'
@@ -299,12 +322,12 @@ class SigningVault:
                     '-deststorepass:env','PMS_NEW_SIGNING_PASSWORD',
                     '-destkeypass:env','PMS_NEW_SIGNING_PASSWORD',
                     '-destalias',alias,'-noprompt'],env=env)
-                return self._save(package,alias,newpassword,target)
+                return self._save(package,alias,newpassword,target,expected_sha256=expected_sha256)
             env=os.environ.copy();env['PMS_SIGNING_PASSWORD']=password
             run([tool('keytool'),'-list','-storetype','PKCS12','-keystore',str(keystore),
                  '-alias',alias,'-storepass:env','PMS_SIGNING_PASSWORD'],env=env)
             shutil.copyfile(keystore,target)
-            return self._save(package,alias,password,target)
+            return self._save(package,alias,password,target,expected_sha256=expected_sha256)
 
     def backup(self, package: str, destination: Path, passphrase: str):
         if len(passphrase) < 12:
@@ -610,7 +633,8 @@ def preflight_signer(source: Path, project_type: str, vault: SigningVault, *,
 
 
 def verify_signer_against_original_apk(apk: Path, package: str, vault: SigningVault, *,
-                                        sdk: dict[str,Path] | None = None) -> str:
+                                        sdk: dict[str,Path] | None = None,
+                                        expected_sha256:str|None=None) -> str:
     """Compare a saved local signer with a *previously signed* APK, read-only."""
     package=validate_package_id(package)
     apk=Path(apk)
@@ -623,7 +647,7 @@ def verify_signer_against_original_apk(apk: Path, package: str, vault: SigningVa
     hashes=re.findall(r'Signer #\d+ certificate SHA-256 digest:\s*([a-fA-F0-9]{64})',out)
     if len(hashes)!=1:
         raise BuildError('Old APK signer could not be uniquely verified')
-    current=vault.load(package)
+    current=release_identity(vault,package,expected_sha256)
     if current is None:
         raise BuildError('Import the original signing keystore before comparing APK signatures')
     if hashes[0].lower()!=current.fingerprint:
@@ -737,6 +761,14 @@ def remote_branches(repo:str)->list[str]:
     return sorted(names)
 
 
+def release_identity(vault,package:str,expected_sha256:str|None):
+    # Older extensions/test vaults can implement only load(); a pinned
+    # fingerprint is still checked by the release preflight below.
+    if expected_sha256 and hasattr(vault,'load_for_certificate'):
+        return vault.load_for_certificate(package,expected_sha256)
+    return vault.load(package)
+
+
 def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
                    project_type='auto',allow_new_key=False,log=None, sdk_root=None,
                    expected_package: str | None = None, recipe_profile: str = 'auto',
@@ -758,7 +790,7 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         if log:log(f'Project type: {kind} | source: {sha[:12]}' +
                    (f' | native recipe: {recipe.profile}' if recipe else ' | generic build'))
         if recipe:
-            identity=vault.load(recipe.package)
+            identity=release_identity(vault,recipe.package,recipe.signer_sha256)
             if not identity and recipe.signer_sha256:
                 raise BuildError('Recipe requires ORIGINAL signing certificate for '+recipe.package+
                     '. Import its matching keystore. New-key generation is forbidden.')
@@ -785,7 +817,7 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
             build_env['CM_BRANCH']=branch
             build_env['CM_COMMIT']=sha
             build_env['CM_REPO_SLUG']=repo_name
-            identity=vault.load(recipe.package)
+            identity=release_identity(vault,recipe.package,recipe.signer_sha256)
             signing={}
             if identity:
                 signing={'CM_KEYSTORE_PATH':str(identity.keystore),
@@ -812,7 +844,7 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         if expected_package and pkg.lower()!=expected_package.lower():
             raise BuildError('Compiled APK package '+pkg+' differs from selected package '+
                              expected_package+'. Do not sign the wrong app variant.')
-        identity=vault.load(pkg)
+        identity=release_identity(vault,pkg,recipe.signer_sha256 if recipe else None)
         if not identity:
             if not allow_new_key:
                 raise BuildError('No signer found for '+pkg+'. Import original release keystore or explicitly authorize NEW signing identity (new installs only).')
@@ -832,7 +864,8 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
                 run_recipe_stage(recipe,'afterSign',src,recipe_step_env,tool,run,apk=dest,log=sanitized_log)
                 # Verification runs again in case a repository-owned post-sign step
                 # touched the APK; signer/package identity must remain invariant.
-                verify_signer_against_original_apk(dest,pkg,vault,sdk=sdk)
+                verify_signer_against_original_apk(dest,pkg,vault,sdk=sdk,
+                    expected_sha256=recipe.signer_sha256)
                 digest=sha256_file(dest)
         except Exception:
             dest.unlink(missing_ok=True)
