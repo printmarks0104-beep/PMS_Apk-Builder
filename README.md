@@ -220,3 +220,37 @@ PMS-Apk-Builder.exe match-keys --repo https://github.com/owner/repo --branch mai
 This searches locally and reports candidate paths and public certificate matches;
 it does **not** prove an APK is compatible until the complete native release
 recipe, private signing-key authentication, and APK verification succeed.
+
+## v0.1.6 — Independent Developer recipes and native artifact checks
+
+PMS remains a **portable, multi-repository** Windows EXE. It does not embed
+SING'OKEY keys, application-specific build steps or branch names. The separate
+optional SING'OKEY recipe archive is used only when deliberately selected.
+
+Schema-1 recipes now accept three additional optional fields:
+- `allowNewSigner` (default `false`): requires explicit first-install
+  authorization to create a signing identity, then saves and reuses it. A recipe
+  with a pinned `signerSha256` must not allow new signer creation.
+- `requiredApkEntries`: exact APK ZIP members that **must** exist and contain
+  readable, nonempty data (for example ABI-specific native libraries, a
+  protected application bundle and build watermark). These checks run before
+  and after post-sign hooks, in addition to any project-defined verifiers.
+- `requiredFileEnvironment`: selected file-path variables from
+  `requiredEnvironment`; each must reference a normal, nonempty local file
+  outside the temporary source checkout.
+
+Native recipe signing values are also passed to **Gradle itself**. A valid
+generic Capacitor shell is no longer accepted as a full release if the recipe
+requires additional Android native components.
+
+The sample Developer recipe uses a separate app identity and an independent
+local Developer Songbook key file. The Customer recipe keeps its pinned
+original signing certificate and payment-gating checks. These recipes do
+**not** enable Customer Premium bypass, regenerate a published app signer, or
+automatically modify an existing SING'OKEY GitHub branch. Existing v3.5
+optional 47,997-song original-songpack Developer compatibility is **not**
+automatically replicated. A real signed APK and device test remain required.
+
+**Signing-key discovery:** v0.1.5's auto-match signer functionality is retained.
+Automatic matching does not grant authorization to rotate a published
+certificate; the recipe's pinned SHA-256 still decides release eligibility.

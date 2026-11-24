@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,7 +25,9 @@ _PACKAGE = re.compile(r'^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$')
 _SHA = re.compile(r'^[a-f0-9]{64}$')
 _ALLOWED_TOOLS = frozenset(('node','python','npm','npx','flutter','java','keytool'))
 _ALLOWED_FIELDS = frozenset(('projectType','package','signerSha256','minApkBytes',
-                             'environment','requiredEnvironment','steps'))
+                             'environment','requiredEnvironment','steps',
+                             'allowNewSigner','requiredApkEntries',
+                             'requiredFileEnvironment'))
 _DISALLOWED_ENV = frozenset(('PATH','PATHEXT','JAVA_HOME','ANDROID_HOME',
     'ANDROID_SDK_ROOT','CM_KEYSTORE_PATH','CM_KEYSTORE_PASSWORD','CM_KEY_PASSWORD',
     'CM_KEY_ALIAS','KARAOKEY_SIGNING_CERT_SHA256','PMS_SIGNING_PASSWORD',
@@ -39,8 +42,11 @@ class Recipe:
     package: str
     signer_sha256: str | None
     min_apk_bytes: int
+    allow_new_signer: bool
+    required_apk_entries: tuple[str,...]
     environment: dict[str,str]
     required_environment: tuple[str,...]
+    required_file_environment: tuple[str,...]
     steps: dict[str,tuple[tuple[str,...],...]]
 
 
@@ -100,6 +106,18 @@ def load_recipe(root:Path, selected_profile:str='auto', external_file:Path|None=
     cert=p.get('signerSha256')
     if cert is not None and (not isinstance(cert,str) or not _SHA.fullmatch(cert)):
         raise RecipeError('Recipe signerSha256 must be a lower-case 64-digit hex fingerprint')
+    allow_new=p.get('allowNewSigner',False)
+    if type(allow_new) is not bool:
+        raise RecipeError('Recipe allowNewSigner must be a boolean')
+    if allow_new and cert is not None:
+        raise RecipeError('Recipe with a pinned signing certificate cannot allow new signers')
+    apk_entries=p.get('requiredApkEntries',[])
+    if not isinstance(apk_entries,list) or len(apk_entries)>80 or len(apk_entries)!=len(set(str(x) for x in apk_entries)):
+        raise RecipeError('Invalid requiredApkEntries list')
+    for entry in apk_entries:
+        if not isinstance(entry,str) or not re.fullmatch(r'[A-Za-z0-9_./+\-]{1,220}',entry) or \
+            entry.startswith('/') or any(part in ('.','..','') for part in entry.split('/')):
+            raise RecipeError('Unsafe requiredApkEntries path')
     minsize=p.get('minApkBytes',0)
     if type(minsize)!=int or minsize<0 or minsize>2*1024*1024*1024:
         raise RecipeError('Recipe minApkBytes is invalid')
@@ -114,6 +132,12 @@ def load_recipe(root:Path, selected_profile:str='auto', external_file:Path|None=
     if not isinstance(required,list) or len(required)>50 or not all(isinstance(x,str)
             and _SAFE_ID.fullmatch(x) and x not in _DISALLOWED_ENV for x in required):
         raise RecipeError('Invalid requiredEnvironment list')
+    required_files=p.get('requiredFileEnvironment',[])
+    if not isinstance(required_files,list) or len(required_files)>20 or \
+            not all(isinstance(x,str) and _SAFE_ID.fullmatch(x) and
+                    x not in _DISALLOWED_ENV for x in required_files) or \
+            not set(required_files).issubset(set(required)):
+        raise RecipeError('requiredFileEnvironment must be a subset of requiredEnvironment')
     steps=p.get('steps',{})
     if not isinstance(steps,dict) or set(steps)-set(STAGES):
         raise RecipeError('Unknown recipe step stage')
@@ -123,8 +147,8 @@ def load_recipe(root:Path, selected_profile:str='auto', external_file:Path|None=
         if not isinstance(entries,list) or len(entries)>24:
             raise RecipeError('Too many recipe steps in '+stage)
         valid_steps[stage]=tuple(_checked_command(v) for v in entries)
-    return Recipe(selected_profile,project_type,package,cert,minsize,dict(env),
-                  tuple(required),valid_steps)
+    return Recipe(selected_profile,project_type,package,cert,minsize,allow_new,tuple(apk_entries),dict(env),
+                  tuple(required),tuple(required_files),valid_steps)
 
 
 def recipe_env(recipe:Recipe, inherited:dict[str,str], signing:dict[str,str],
@@ -142,6 +166,18 @@ def recipe_env(recipe:Recipe, inherited:dict[str,str], signing:dict[str,str],
     if missing:
         raise RecipeError('Required build configuration is missing: '+', '.join(missing)+
             '. Save these values in the encrypted repository build-secret vault.')
+    for name in recipe.required_file_environment:
+        filename=Path(env[name]).expanduser()
+        if not filename.is_absolute() or not filename.is_file() or filename.is_symlink() or \
+                not (16<=filename.stat().st_size<=1024*1024):
+            raise RecipeError('Required local secret file is missing, unsafe, or empty: '+name)
+        if source_root is not None:
+            try:
+                filename.resolve(strict=True).relative_to(Path(source_root).resolve(strict=True))
+            except ValueError:
+                pass
+            else:
+                raise RecipeError('Required local secret file must be OUTSIDE source checkout: '+name)
     return env
 
 
@@ -158,3 +194,29 @@ def run_recipe_stage(recipe:Recipe, stage:str, src:Path, env:dict[str,str],
         target=tool_resolver(executable)
         if log:log('Recipe ['+stage+']: '+command[0]+' '+command[1])
         runner([target,*args],cwd=src,env=env,log=log)
+
+
+def verify_recipe_apk_contents(recipe:Recipe, apk:Path)->None:
+    """Fail closed on missing expected native libraries and protected web assets."""
+    apk=Path(apk)
+    if not apk.is_file() or apk.stat().st_size < recipe.min_apk_bytes:
+        raise RecipeError('APK too small for required native release recipe: minimum '+
+                          str(recipe.min_apk_bytes)+' bytes. Missing native features; refusing release.')
+    if not recipe.required_apk_entries:
+        return
+    try:
+        with zipfile.ZipFile(apk,'r') as archive:
+            names=set(archive.namelist())
+            missing=[name for name in recipe.required_apk_entries if name not in names]
+            if missing:
+                raise RecipeError('Missing required APK component(s): '+', '.join(missing[:8]))
+            # The ZIP central directory is not sufficient evidence of readable bytes.
+            for name in recipe.required_apk_entries:
+                if archive.getinfo(name).file_size == 0:
+                    raise RecipeError('Required APK component is empty: '+name)
+                # Read each required component to check CRC and reject truncated ZIPs.
+                with archive.open(name) as content:
+                    while content.read(1024*1024):
+                        pass
+    except (zipfile.BadZipFile,EOFError,OSError) as e:
+        raise RecipeError('APK ZIP validation failed') from e

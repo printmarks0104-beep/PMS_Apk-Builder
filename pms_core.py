@@ -19,9 +19,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from pms_recipe import RecipeError, load_recipe, recipe_env, run_recipe_stage
+from pms_recipe import RecipeError, load_recipe, recipe_env, run_recipe_stage, verify_recipe_apk_contents
 
-VERSION = '0.1.5'
+VERSION = '0.1.6'
 BACKUP_AAD = b'PMS-APK-BUILDER-KEY-BACKUP-V1'
 PKG_RE = re.compile(r'^[a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)+$')
 BRANCH_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,198}$')
@@ -710,7 +710,10 @@ def build_source(root:Path, project_type:str, log=None, env=None, sdk_root=None,
         if sdk_root is not None:configure_gradle_sdk(gradle_dir,Path(sdk_root))
         if recipe:run_recipe_stage(recipe,'beforeGradle',root,recipe_step_env or env,tool,run,log=log)
         if os.name!='nt':wrapper.chmod(wrapper.stat().st_mode|0o111)
-        run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log,env=env)
+        # Project-defined Gradle signing requires the validated recipe signer
+        # environment, not only the default npm environment.
+        gradle_env=recipe_step_env if recipe else env
+        run([str(wrapper),'assembleRelease','--no-daemon','--console=plain'],cwd=gradle_dir,log=log,env=gradle_env)
     else:
         raise BuildError('Unsupported project type')
 
@@ -790,6 +793,8 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         if log:log(f'Project type: {kind} | source: {sha[:12]}' +
                    (f' | native recipe: {recipe.profile}' if recipe else ' | generic build'))
         if recipe:
+            if recipe.signer_sha256 and allow_new_key:
+                raise BuildError('Pinned Customer/release signer: turn OFF new signing-key creation.')
             identity=release_identity(vault,recipe.package,recipe.signer_sha256)
             if not identity and recipe.signer_sha256:
                 raise BuildError('Recipe requires ORIGINAL signing certificate for '+recipe.package+
@@ -798,8 +803,15 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
                 raise BuildError('SIGNER MISMATCH: saved signer for '+recipe.package+
                     ' does not match the original certificate required by this release recipe. '
                     'Do not publish an update using a different signing key.')
-            if not identity and not allow_new_key:
-                raise BuildError('No signer imported for recipe package '+recipe.package)
+            if not identity:
+                if not allow_new_key:
+                    raise BuildError('No signer imported for recipe package '+recipe.package)
+                if not recipe.allow_new_signer:
+                    raise BuildError('Recipe forbids creating a new signing identity. Import the original signer.')
+                # Consent is explicit and the independent first-release identity is preserved
+                # even if later compilation fails; retries must reuse this certificate.
+                identity=vault.create(recipe.package,confirm=True)
+                if log:log('New signing identity saved for '+recipe.package+'; export an encrypted backup.')
         else:
             preflight_signer(src,kind,vault,expected_package=expected_package,
                              allow_new_key=allow_new_key,log=log)
@@ -857,11 +869,11 @@ def create_release(repo:str,branch:str,output:Path,vault:SigningVault, *,
         digest=signed_apk(apk,pkg,identity,dest,sdk,log=log)
         try:
             if recipe:
-                if dest.stat().st_size<recipe.min_apk_bytes:
-                    raise BuildError('APK too small for required native release recipe: '+
-                        str(dest.stat().st_size)+' bytes, minimum '+str(recipe.min_apk_bytes)+
-                        '. Missing native features; refusing release.')
+                try:verify_recipe_apk_contents(recipe,dest)
+                except RecipeError as exc:raise BuildError(str(exc)) from exc
                 run_recipe_stage(recipe,'afterSign',src,recipe_step_env,tool,run,apk=dest,log=sanitized_log)
+                try:verify_recipe_apk_contents(recipe,dest)
+                except RecipeError as exc:raise BuildError(str(exc)) from exc
                 # Verification runs again in case a repository-owned post-sign step
                 # touched the APK; signer/package identity must remain invariant.
                 verify_signer_against_original_apk(dest,pkg,vault,sdk=sdk,
